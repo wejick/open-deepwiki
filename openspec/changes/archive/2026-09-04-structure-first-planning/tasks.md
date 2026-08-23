@@ -1,0 +1,23 @@
+## 1. Digest structure and rendering (`src/producer/claudeDigest.ts`)
+
+- [x] 1.1 Add a structured tree core: one function reads the documentable tracked files with their byte sizes (per-file `stat` already best-effort today) and returns directory → ordered file entries; `repoDigest` is re-expressed on top of it so the whole-tree text stays deterministic. Verify the existing `claudeDigest.test.ts` describe blocks still pass unchanged except where file-name lines make a `toContain` assertion stricter.
+- [x] 1.2 Render each directory's files largest-first (size desc, then path asc for ties), up to a `DIGEST_MAX_FILES_PER_DIR = 10` constant, with a `… and M more files` marker when truncated, in the whole-tree digest. Verify a new test in `claudeDigest.test.ts`: a directory with >10 files names its 10 largest in order and reports the remainder count; the existing `maxDirs` cap and header lines are unchanged.
+- [x] 1.3 Add a subset renderer for an area slice: given the structured tree and a set of owned scope paths (directories or single files, `.` for the repo root's own files — reuse `claudePlan.ts`'s path semantics), render only the directories under those paths, in the same format. Verify a new test: a slice over `src/a/` lists `src/a/` and its subdirectories' files but no sibling directory's structure; a slice over a single file path renders that file only.
+- [x] 1.4 Confirm slice and whole rendering share the size/order/marker helpers, and that a slice never lists files of an excluded (non-documentable) kind. Verify with the existing non-documentable digest tests extended to a slice.
+
+## 2. Orchestration and directives (`src/producer/claude.ts`)
+
+- [x] 2.1 Build the structured tree once per init run that reaches planning (not per session), whether or not the map runs that run, and reuse it for the whole-digest file and every area slice. Verify the existing split-planning tests pass and a resumed run (map already present) still reaches the area loop without rebuilding tracked files twice.
+- [x] 2.2 Seed the undecomposed init planner: when `mode === "init"` and planning replans, write the whole handout to `<promptDir>/digest.txt` and add a line to `plannerDirectives` pointing the session at it (structure is authoritative; read only to understand). Verify the planner prompt test asserts the init planner's prompt references the handout file and the update planner's prompt does not.
+- [x] 2.3 Seed each area session: before an area session spawns, write `<promptDir>/digest-<areaId>.txt` from the tree's subset over that area's owned paths, and add the handout path to `areaDirectives` alongside the area's owned paths. Verify the area prompt test asserts the slice path appears and (new) that the slice lists only the area's owned subtree.
+- [x] 2.4 Add the per-session-kind tool allowlist: `runSession` takes an `allowedTools` argument (defaulting to the existing `ALLOWED_TOOLS`), and map/area sessions and the init-mode planner spawn with `Read,Grep,Write` (no `Glob`, no `Edit`); update planner, page, overview, and repair sessions keep the full set. Verify spawn-argv assertions in `claude.test.ts` per scenario: map, area, and init planner exclude `Glob`; page and update-planner spawns still contain the full `ALLOWED_TOOLS`.
+
+## 3. Authoring guidance (`src/producer/skill/skills/okf-wiki/`)
+
+- [x] 3.1 Add the structure-first block to `PLANNER.md`: when this session's instructions point at a structure handout, that handout is authoritative for what exists, file reads are for understanding a directory, grounding a scope/brief, or tracing a flow, and pages still organize around systems and workflows, never the tree; keep the staged-exploration and system-oriented guidance intact. Verify a content test asserts the phase prompt contains the handout-authoritative and read-when-needed phrases (mirroring the existing "staged, system-oriented" prompt test).
+- [x] 3.2 Strengthen `MAP.md`: the digest names each directory's load-bearing files, so reading is only to learn what a directory is for coherent boundaries. Verify the map content test asserts the digest-is-authoritative phrase and no phrase directing file-by-file reading.
+
+## 4. Spec-driven verification
+
+- [x] 4.1 Cover every scenario of the two new requirements with a test named `<Requirement> › <Scenario>`, in `claudeDigest.test.ts` (handout names files, slice scope) and `claude.test.ts` (init planner seeded, update not seeded, per-kind allowlists, guidance content). Verify `bun test ./src ./test` passes offline.
+- [x] 4.2 Run the standing gates on the finished change: `openspec validate --specs`, `bun run lint`, `bun run typecheck`, `bun run format`, and confirm no new config knobs were introduced.

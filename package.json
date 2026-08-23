@@ -1,0 +1,41 @@
+{
+  "name": "open-deepwiki",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Org-scale self-hosted DeepWiki clone: openwiki CLI adapter -> OKF v0.2 bundles -> shared libSQL index -> MCP HTTP server",
+  "type": "module",
+  "bin": {
+    "open-deepwiki": "src/cli/main.ts"
+  },
+  "scripts": {
+    "dev": "bun run src/cli/main.ts",
+    "test": "bun scripts/test.ts --timeout 20000",
+    "lint": "oxlint src test",
+    "format": "oxfmt src test",
+    "format:check": "oxfmt --check src test",
+    "typecheck": "tsc --noEmit",
+    "eval": "bun test/eval/run.ts"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@libsql/client": "^0.17.4",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@toon-format/toon": "^4.1.1",
+    "gray-matter": "^4.0.3",
+    "jsdom": "^30.0.1",
+    "markdown-it": "^15.0.1",
+    "mermaid": "^11.17.2",
+    "node-cron": "^4.6.0",
+    "shiki": "^4.4.3",
+    "simple-git": "^3.36.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "@types/jsdom": "^30.0.0",
+    "oxfmt": "^0.64.0",
+    "oxlint": "^1.79.0",
+    "typescript": "^7.0.2"
+  }
+}

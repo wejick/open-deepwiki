@@ -1,0 +1,17 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "warn"
+  },
+  "rules": {
+    "eslint/no-await-in-loop": "off",
+    "oxc/no-map-spread": "off"
+  },
+  "ignorePatterns": ["openspec/**", ".opencode/**"],
+  "env": {
+    "browser": false,
+    "node": true
+  }
+}

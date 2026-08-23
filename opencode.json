@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "open-deepwiki": {
+        "type": "remote",
+        "url": "http://127.0.0.1:7245/mcp",
+        "enabled": true
+      }
+    }
+  }
+}

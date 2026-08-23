@@ -1,0 +1,15 @@
+{
+  "note": "Golden question set for retrieval parity (harness task 1.3). Task 1.6 replaces the entries below with 40-60 real questions across the 1.5 sample repos, authored by someone who knows those codebases. The current entries are a seeded set for test/fixtures/grounding/checkout, kept so the harness has a working example of the schema: { question, keywords?, answers[] } where answers are repo-relative SOURCE paths that should be retrieved.",
+  "questions": [
+    {
+      "question": "How are tokens validated and what makes one invalid?",
+      "keywords": ["token"],
+      "answers": ["src/auth.ts"]
+    },
+    {
+      "question": "How long do cache entries live before expiring?",
+      "keywords": ["cache"],
+      "answers": ["src/cache.ts"]
+    }
+  ]
+}

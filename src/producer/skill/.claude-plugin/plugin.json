@@ -1,0 +1,7 @@
+{
+  "name": "odw-okf",
+  "displayName": "open-deepwiki OKF authoring",
+  "version": "0.1.0",
+  "description": "Author and maintain the OKF wiki bundle for a repository checkout, for consumption by open-deepwiki's retrieval index.",
+  "license": "MIT"
+}

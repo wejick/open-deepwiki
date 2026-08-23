@@ -1,0 +1,58 @@
+schema: spec-driven
+
+# Project context — shown to AI when creating artifacts.
+context: |
+  Project: open-deepwiki — org-scale (~100 repos) local DeepWiki clone.
+  Pipeline: pure-git repo manager → openwiki CLI adapter (OKF v0.2 bundles) →
+  shared libSQL index (repo_id-scoped) → shared-LAN MCP HTTP server (bearer token).
+
+  Tech stack:
+  - Bun >= 1.4 is the runtime (executes TypeScript natively — no ts-node/tsx,
+    no build step for dev), package manager (bun.lock), and test runner (bun:test)
+  - TypeScript, latest 5.x, ESM + NodeNext; typecheck via tsc --noEmit
+  - Lint + format: oxlint and oxfmt (oxc toolchain — no eslint, no prettier)
+  - libSQL storage via @libsql/client in embedded file: mode (built-in vectors:
+    F32_BLOB + vector_distance_cos — no sqlite-vec extension, no node-gyp addons);
+    ONE shared database, all rows scoped by repo_id (indexes on repo_id);
+    text bodies never stored in the DB (read from disk)
+  - External CLI prerequisites: openwiki (pinned ^0.3), rg (ripgrep)
+  - @modelcontextprotocol/sdk Streamable HTTP transport
+
+  Engineering principles (enforced, not aspirational):
+  - No over-engineering: ship the smallest thing that satisfies the spec.
+    No speculative abstraction, no config knob without a scenario that needs it,
+    no dependency without a direct consumer. Every addition traces to a
+    requirement; if it doesn't, it's cut.
+  - BANNED: clean/onion/hexagonal architecture and any multi-layer abstraction —
+    no use-case/handler indirection, no repository or service interfaces over a
+    single implementation, no DI containers/factories, no port/adapter seams,
+    no re-export barrel files. The codebase is flat and concrete:
+    src/<capability>/*.ts (config, producer, index, repoManager, server, monitor,
+    cli), functions importing and calling what they use directly
+    (@libsql/client, simple-git, node-cron used as-is).
+    The only swap points (openwiki CLI child process, LLM endpoint) are already
+    process/config boundaries — they must not grow code seams.
+    Tests call real functions against fixture data; we mock child processes and
+    HTTP APIs, never our own internal interfaces.
+  - Proper tests: every implementation task ships with its tests in the same
+    task. Mock the openwiki CLI and embedding API; fixture repos on disk;
+    no live network in CI. bun:test, coverage gate on changed code.
+  - Latest TS best practices: strict, noUncheckedIndexedAccess,
+    verbatimModuleSyntax, exactOptionalPropertyTypes; type-only imports;
+    unions + satisfies over enums; oxlint for linting, oxfmt for formatting,
+    tsc --noEmit for type-aware checks.
+
+# Per-artifact rules (optional)
+rules:
+  proposal:
+    - Keep proposals under 400 words; the Non-goals section is mandatory
+  design:
+    - Every decision includes an "alternatives considered" line
+    - If a decision adds a dependency or a config knob, name the requirement
+      it serves — otherwise it violates the no-over-engineering principle
+  specs:
+    - Every requirement has at least one testable scenario
+  tasks:
+    - Every implementation task pairs with its tests (same checkbox or an
+      adjacent one); no task without an acceptance check
+    - Tasks sized to ~2 hours max; split larger ones

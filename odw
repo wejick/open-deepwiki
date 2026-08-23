@@ -1,0 +1,5 @@
+#!/usr/bin/env bun
+// Zero-install CLI entry: run `bun odw <command>` from the repo root.
+// (Equivalent to `bun run src/cli/main.ts <command>`.)
+import { main } from "./src/cli/main.ts";
+process.exit(await main(process.argv.slice(2)));

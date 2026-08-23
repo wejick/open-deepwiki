@@ -1,0 +1,23 @@
+# secrets
+.env
+.env.*
+!.env.template
+
+# deps / build
+node_modules/
+dist/
+
+# local state (dataDir: clones, shared index.db, registry, events.jsonl)
+data/
+.opendepwiki/
+
+# benchmark scratch (clones + index.db per model×repo)
+bench/data/
+
+# sqlite sidecar files (if DB is moved out of data/)
+*.db
+*.db-wal
+*.db-shm
+
+# os/editor noise
+.DS_Store

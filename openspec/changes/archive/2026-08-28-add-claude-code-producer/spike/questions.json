@@ -1,0 +1,30 @@
+{
+  "note": "Golden questions for the spike fixture (spike/init and spike/update). Answers are repo-relative SOURCE paths that a good bundle should make retrievable. Deliberately phrased as conceptual 'how does X work' questions rather than identifier lookups — a question answerable by grepping the sources tells you nothing about whether the wiki helped, which is the trap noted for task 1.6.",
+  "questions": [
+    {
+      "question": "How does the cache decide which entry to drop when it is full?",
+      "keywords": ["evict capacity"],
+      "answers": ["src/cache.ts"]
+    },
+    {
+      "question": "When does a stored value stop being returned, and is it removed at that moment?",
+      "keywords": ["expire"],
+      "answers": ["src/store.ts"]
+    },
+    {
+      "question": "What happens to recency ordering when an existing key is read?",
+      "keywords": ["recently used"],
+      "answers": ["src/cache.ts"]
+    },
+    {
+      "question": "How is a session identifier shortened for logging?",
+      "keywords": ["log"],
+      "answers": ["src/format.ts"]
+    },
+    {
+      "question": "How are the two storage layers composed to track logged-in sessions?",
+      "keywords": ["session"],
+      "answers": ["src/index.ts", "src/store.ts"]
+    }
+  ]
+}

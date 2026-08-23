@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>open-deepwiki dashboard</title>
+    <style>
+      /* layout + readability only */
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 1rem auto;
+        max-width: 72rem;
+        padding: 0 1rem;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 0.5rem 0;
+      }
+      th,
+      td {
+        border: 1px solid #bbb;
+        padding: 0.3rem 0.5rem;
+        text-align: left;
+        vertical-align: top;
+        font-size: 0.9rem;
+      }
+      button {
+        margin: 0.1rem 0.25rem 0.1rem 0;
+      }
+      label {
+        margin-right: 1rem;
+      }
+      input[type="text"] {
+        min-width: 22rem;
+      }
+      textarea {
+        width: 100%;
+        box-sizing: border-box;
+      }
+      pre {
+        background: #f4f4f4;
+        border: 1px solid #ddd;
+        padding: 0.5rem;
+        overflow-x: auto;
+      }
+      section {
+        margin-bottom: 1.5rem;
+      }
+      .green {
+        color: #087008;
+      }
+      .yellow {
+        color: #8a6d00;
+      }
+      .red,
+      .err {
+        color: #b00020;
+      }
+      .muted {
+        color: #666;
+      }
+      details.err > summary {
+        cursor: pointer;
+      }
+      .err-detail {
+        color: #222;
+        margin: 0.3rem 0 0;
+        max-height: 20rem;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <strong>open-deepwiki</strong> &nbsp;
+      <label>token <input id="token" type="password" autocomplete="off" /></label>
+      <button id="refresh">Refresh</button>
+      <span id="summary" class="muted"></span>
+    </header>
+
+    <section>
+      <h2>Repos</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>repo</th>
+            <th>health</th>
+            <th>wiki docs</th>
+            <th>source docs</th>
+            <th>sha</th>
+            <th>last run</th>
+            <th>schedule</th>
+            <th>progress</th>
+            <th>error / actions</th>
+          </tr>
+        </thead>
+        <tbody id="repo-rows"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Add repo</h2>
+      <form id="add-form">
+        <input
+          id="add-source"
+          type="text"
+          placeholder="git@gitlab.corp:team/repo.git or /local/path"
+          required
+        />
+        <select id="add-producer">
+          <option value="openwiki">openwiki</option>
+          <option value="claude">claude</option>
+        </select>
+        <textarea
+          id="add-excludes"
+          rows="2"
+          placeholder="exclude globs, one per line (e.g. **/__snapshots__/**)"
+        ></textarea>
+        <button type="submit">Add</button>
+        <span id="add-result" class="muted"></span>
+      </form>
+    </section>
+
+    <section>
+      <h2>MCP tools</h2>
+      <p>
+        <select id="tool-select"></select>
+        <button id="tool-call" type="button">Call</button>
+      </p>
+      <form id="tool-form"></form>
+      <pre id="tool-result" class="muted">no call yet</pre>
+    </section>
+
+    <script type="module" src="/dashboard.js"></script>
+  </body>
+</html>
