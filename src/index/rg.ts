@@ -165,7 +165,7 @@ export async function lexicalSearch(
   const plan = buildPlan(opts.lex);
   if (plan.pattern === "") return { files: [], available: true, warning: null };
 
-  const args = ["--json", "--no-heading", "-i", "--max-count", String(cfg.rgMaxCountPerFile)];
+  const args = ["--json", "-i", "--max-count", String(cfg.rgMaxCountPerFile)];
   if (cfg.maxFileSizeBytes > 0) args.push("--max-filesize", String(cfg.maxFileSizeBytes));
   for (const g of cfg.excludeGlobs) args.push("-g", `!${g}`);
   for (const g of cfg.includeGlobs) if (g !== "*" && g !== "**") args.push("-g", g);
@@ -209,19 +209,14 @@ export async function lexicalSearch(
       warning: "rg timed out — degraded to vector-only search",
     };
   }
+  // exit 1 = no matches (normal); anything else is an error (e.g. bad pattern)
   if (proc.exitCode !== 0 && proc.exitCode !== 1) {
-    // exit 1 = no matches (normal); anything else is an error (e.g. bad pattern)
     const err = await new Response(proc.stderr).text();
-    if (proc.exitCode === 2) {
-      return { files: [], available: false, warning: `rg error: ${err.slice(0, 200)}` };
-    }
+    return { files: [], available: false, warning: `rg error: ${err.slice(0, 200)}` };
   }
 
   const stdout = await new Response(proc.stdout).text();
-  const perFile = new Map<
-    string,
-    { terms: Map<number, number>; lines: Set<number>; matches: number }
-  >();
+  const perFile = new Map<string, { terms: Set<number>; lines: Set<number>; matches: number }>();
 
   for (const line of stdout.split("\n")) {
     if (line === "") continue;
@@ -246,7 +241,7 @@ export async function lexicalSearch(
 
     let rec = perFile.get(filePath);
     if (!rec) {
-      rec = { terms: new Map(), lines: new Set(), matches: 0 };
+      rec = { terms: new Set(), lines: new Set(), matches: 0 };
       perFile.set(filePath, rec);
     }
     rec.lines.add(lineNo);
@@ -254,7 +249,7 @@ export async function lexicalSearch(
     const sub = event.data?.submatches?.[0]?.match?.text;
     if (sub !== undefined && plan.attributable) {
       const termIdx = plan.variantToTerm.get(sub.toLowerCase());
-      if (termIdx !== undefined) rec.terms.set(termIdx, (rec.terms.get(termIdx) ?? 0) + 1);
+      if (termIdx !== undefined) rec.terms.add(termIdx);
     }
   }
 
@@ -270,18 +265,16 @@ export async function lexicalSearch(
     } else {
       // Entry satisfied iff every one of its terms matched in this file.
       satisfied = 0;
-      for (let e = 0; e < plan.totalEntries; e++) {
-        const matchedInEntry = [...rec.terms.keys()].filter(
-          (t) => plan.termToEntry[t] === e,
-        ).length;
-        if (matchedInEntry >= (plan.entrySize[e] ?? 1)) satisfied++;
+      for (const [e, size] of plan.entrySize.entries()) {
+        const matchedInEntry = [...rec.terms].filter((t) => plan.termToEntry[t] === e).length;
+        if (matchedInEntry >= size) satisfied++;
       }
     }
     files.push({
       path,
       matches: rec.matches,
-      coverage: satisfied / Math.max(1, plan.totalEntries),
-      density: rec.matches / Math.max(1, rec.lines.size),
+      coverage: satisfied / plan.totalEntries,
+      density: rec.matches / rec.lines.size,
       lines: [...rec.lines].toSorted((a, b) => a - b),
     });
   }

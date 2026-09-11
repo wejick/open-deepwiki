@@ -1,5 +1,5 @@
 import type { Client } from "@libsql/client";
-import { getRepoMeta, listChunks, setRepoMeta } from "./db.ts";
+import { listChunks, setRepoMeta } from "./db.ts";
 
 /**
  * Repo concept derivation (3.7): auto-derived concept terms (aggregated wiki
@@ -9,7 +9,8 @@ import { getRepoMeta, listChunks, setRepoMeta } from "./db.ts";
  */
 
 const STOPWORDS = new Set(
-  "a an and are as at be been being but by can did do does for from get got has have had he her hers him his how i if in into is it its just made make makes me more most my new no nor not now of on only or other our ours out over own same she so some such than that the their them then there these they this those to too under until up use used uses using very was we were what when where which while who why will with work would you your yours the its".split(
+  // tokenize() drops 1-2 char tokens before this set is consulted.
+  "and are been being but can did does for from get got has have had her hers him his how into its just made make makes more most new nor not now only other our ours out over own same she some such than that the their them then there these they this those too under until use used uses using very was were what when where which while who why will with work would you your yours".split(
     " ",
   ),
 );
@@ -20,16 +21,11 @@ function tokenize(text: string): string[] {
   );
 }
 
-export type DerivedMeta = {
-  conceptTerms: string[];
-  centroid: number[] | null;
-};
-
 export async function deriveRepoMeta(
   db: Client,
   repoId: string,
   opts: { dim: number; linkResolved: number; linkTotal: number },
-): Promise<DerivedMeta> {
+): Promise<void> {
   const chunks = await listChunks(db, repoId, "wiki");
   const counter = new Map<string, number>();
   const bump = (term: string, weight: number) =>
@@ -81,10 +77,4 @@ export async function deriveRepoMeta(
     linkResolved: opts.linkResolved,
     linkTotal: opts.linkTotal,
   });
-  return { conceptTerms: terms, centroid };
-}
-
-/** Read the stored derived meta (for listings / server status). */
-export async function readRepoMeta(db: Client, repoId: string) {
-  return getRepoMeta(db, repoId);
 }

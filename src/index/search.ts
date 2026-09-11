@@ -49,7 +49,7 @@ function rrf(rank: number): number {
   return 1 / (60 + rank);
 }
 
-export async function readSnippet(
+async function readSnippet(
   filePath: string,
   startLine: number,
   matchLines: number[],
@@ -175,7 +175,6 @@ export async function hybridSearch(
       warnings.push(res.warning);
     }
   }
-  const lexical = { files: lexicalFiles, available: lexicalAvailable };
 
   // ---- vector: concurrent per-repo queries ----
   const vecByRepo = new Map<string, Map<number, { rank: number; sim: number }>>();
@@ -214,7 +213,7 @@ export async function hybridSearch(
 
     // lexical rank per path (best = lowest rank across its chunks' files)
     const lexByPath = new Map<string, { rank: number; lines: number[] }>();
-    lexical.files.forEach((f, rank) => {
+    lexicalFiles.forEach((f, rank) => {
       if (repoOfFile(f.path, opts.checkouts) !== repoId) return;
       const key = chunkPathOf(f.path, checkout);
       const cur = lexByPath.get(key);
@@ -314,7 +313,7 @@ export async function hybridSearch(
   return {
     results,
     warnings,
-    lexicalAvailable: lexical.available,
+    lexicalAvailable,
   };
 }
 
@@ -334,8 +333,7 @@ async function routeRepos(
   const centroids = await listRepoCentroids(db);
   if (centroids.size === 0) {
     warnings.push("centroid routing unavailable — searching all repos lexically");
-    const registered = [...checkouts.keys()];
-    return registered.length > 0 ? registered : [...centroids.keys()];
+    return [...checkouts.keys()];
   }
   const ranked = [...centroids.entries()]
     .map(([repoId, centroid]) => ({ repoId, sim: cosine(queryVec, centroid) }))

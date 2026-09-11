@@ -1,20 +1,4 @@
-/**
- * open-deepwiki CLI entry point.
- *
- * Subcommands:
- *   repo add <url|path> [--no-wiki] [--instructions <file|->] [--producer <id>] [--exclude <glob>]
- *   repo add --from-file <file> [--no-wiki]   batch import
- *   repo instructions <repoId> [--show]       show wiki instructions
- *   repo remove <repoId>
- *   repo list [--json]
- *   repo update <repoId>
- *   repo reinit <repoId>                      discard the wiki and rebuild from scratch
- *   update --all                        update all repos (standalone cron mode)
- *   index <repoId>                      re-index wiki bundle + sources
- *   serve                               run the MCP HTTP server
- *   status [--failing|--json|--server <url>]   per-repo health table
- *   logs [--repo <repoId>] [--progress]    tail the event log
- */
+/** open-deepwiki CLI entry point. Commands are listed in USAGE below. */
 
 import { readFile } from "node:fs/promises";
 import {
@@ -26,7 +10,8 @@ import {
 } from "../config/config.ts";
 import { docCounts, getRepoMeta, purgeRepo } from "../index/db.ts";
 import { indexRepo } from "../index/update.ts";
-import { appendEvent } from "../monitor/events.ts";
+import { appendEvent, readEvents } from "../monitor/events.ts";
+import { buildStatusSummary } from "../monitor/status.ts";
 import { registerRepo, runAddPipeline } from "../repoManager/add.ts";
 import { openContext, type Ctx } from "../repoManager/context.ts";
 import { acquireRepoLock } from "../repoManager/lock.ts";
@@ -41,12 +26,13 @@ import {
 import { runQueue } from "../repoManager/queue.ts";
 import {
   getRepo,
+  loadRegistry,
   producerFor,
   saveRegistry,
   saveState,
   type RepoRecord,
 } from "../repoManager/registry.ts";
-import { updateAllRepos } from "../repoManager/scheduler.ts";
+import { createScheduler, updateAllRepos } from "../repoManager/scheduler.ts";
 
 const USAGE = `open-deepwiki — org-scale DeepWiki clone
 
@@ -82,7 +68,7 @@ export async function main(argv: string[]): Promise<number> {
     case "index":
       return indexCommand(rest);
     case "serve":
-      return serveCommand(rest);
+      return serveCommand();
     case "status":
       return statusCommand(rest);
     case "logs":
@@ -236,9 +222,9 @@ async function addRepo(
     );
     return 1;
   }
-  if (ctx.registry.repos.some((r) => r.source === source.trim())) {
-    const existing = ctx.registry.repos.find((r) => r.source === source.trim());
-    console.error(`error: source already registered as ${existing?.repoId}`);
+  const existing = ctx.registry.repos.find((r) => r.source === source.trim());
+  if (existing) {
+    console.error(`error: source already registered as ${existing.repoId}`);
     return 1;
   }
   const record = registerRepo(ctx, source, noWiki, instructions, producer, excludeGlobs);
@@ -507,15 +493,13 @@ async function indexCommand(argv: string[]): Promise<number> {
   }
 }
 
-async function serveCommand(_argv: string[]): Promise<number> {
+async function serveCommand(): Promise<number> {
   const cfg = loadConfig();
   const { startServer } = await import("../server/server.ts");
-  const { createScheduler } = await import("../repoManager/scheduler.ts");
-  const { openContext: openCtx } = await import("../repoManager/context.ts");
 
   // Writable DB for the scheduler + admin API; the server opens its own
   // read-only handle for MCP/status reads.
-  const ctx = await openCtx(cfg);
+  const ctx = await openContext(cfg);
   const scheduler = createScheduler(cfg, ctx.db);
   const served = await startServer({
     cfg,
@@ -561,16 +545,13 @@ async function statusCommand(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<number> {
   const cfg = loadConfig(env);
-  const { buildStatusSummary } = await import("../monitor/status.ts");
-  const { openContext: openCtx } = await import("../repoManager/context.ts");
-  const { loadRegistry } = await import("../repoManager/registry.ts");
 
   const failing = argv.includes("--failing");
   const json = argv.includes("--json");
   const serverIdx = argv.indexOf("--server");
   const serverUrl = serverIdx >= 0 ? (argv[serverIdx + 1] ?? "") : null;
   const registry = await loadRegistry(cfg);
-  const ctx = await openCtx(cfg);
+  const ctx = await openContext(cfg);
   try {
     let summary = await buildStatusSummary(cfg, ctx.db, registry);
 
@@ -643,7 +624,6 @@ async function statusCommand(
 
 async function logsCommand(argv: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
   const cfg = loadConfig(env);
-  const { readEvents } = await import("../monitor/events.ts");
   const repoIdx = argv.indexOf("--repo");
   const repoId = repoIdx >= 0 ? (argv[repoIdx + 1] ?? "") : undefined;
   // Filter before tailing: a mid-build repo's beats would otherwise push the
