@@ -86,13 +86,49 @@ const CLAUDE_OK = JSON.stringify({
 
 export const CLAUDE_PROBES = [
   'if [ "$1" = "--version" ]; then echo "2.1.228 (Claude Code)"; exit 0; fi',
-  'if [ "$1" = "--help" ]; then echo "  --setting-sources <sources>  Comma-separated list"; exit 0; fi',
+  [
+    'if [ "$1" = "--help" ]; then',
+    '  echo "  --setting-sources <sources>  Comma-separated list"',
+    '  echo "  -r, --resume [value]  Resume a conversation by session ID"',
+    '  echo "  --session-id <uuid>  Use a specific session ID for the conversation"',
+    "  exit 0",
+    "fi",
+  ].join("\n"),
 ];
 
 export const CLAUDE_PROBES_LEGACY = [
   'if [ "$1" = "--version" ]; then echo "2.0.9 (Claude Code)"; exit 0; fi',
   'if [ "$1" = "--help" ]; then echo "  --allowedTools <tools...>"; exit 0; fi',
 ];
+
+/** Reads `--session-id`/`--resume` out of the argv, so a test can assert which
+ *  sessions were named, which were resumed — and which were neither. */
+const SESSION_CAPTURE = [
+  'SESS_MODE=""',
+  'SESS_ID=""',
+  '_prev=""',
+  'for _a in "$@"; do',
+  '  if [ "$_prev" = "--session-id" ]; then SESS_MODE="new"; SESS_ID="$_a"; fi',
+  '  if [ "$_prev" = "--resume" ]; then SESS_MODE="resume"; SESS_ID="$_a"; fi',
+  '  _prev="$_a"',
+  "done",
+  'if [ -n "$SESS_MODE" ] && [ -n "$ODW_SESSION_FLAGS_OUT" ]; then',
+  '  echo "$SESS_MODE $SESS_ID" >> "$ODW_SESSION_FLAGS_OUT"',
+  "fi",
+].join("\n");
+
+/** Proves the producer's ordering from inside the child: a fresh session's
+ *  identity and a resume's identity are both already in the sidecar by the
+ *  time the session runs — recorded before the spawn, never after. */
+const SESSION_SIDECAR_CHECK = [
+  'if [ -n "$SESS_MODE" ] && [ -n "$ODW_SESSION_CHECKS_OUT" ]; then',
+  '  if grep -q "$SESS_ID" ./openwiki/.odw-sessions.json 2>/dev/null; then',
+  '    echo "$SESS_MODE:recorded:$PAGE_PATH" >> "$ODW_SESSION_CHECKS_OUT"',
+  "  else",
+  '    echo "$SESS_MODE:unrecorded:$PAGE_PATH" >> "$ODW_SESSION_CHECKS_OUT"',
+  "  fi",
+  "fi",
+].join("\n");
 
 /** A conformant page at `$PAGE_PATH` — enough for its job to count as done. */
 export const WRITE_PAGE =
@@ -138,13 +174,17 @@ export function claudeSessions(parts: {
   /** Before any branching, the planning session included. */
   first?: string[];
   payload?: string;
+  /** The `--help`/`--version` banner; the default advertises the session
+   *  flags, the legacy set (task: degrade) advertises neither. */
+  probes?: string[];
 }): Promise<string> {
   const report = `cat <<'JSON'\n${parts.payload ?? CLAUDE_OK}\nJSON`;
   return writeShim(
     "claude",
     [
-      ...CLAUDE_PROBES,
+      ...(parts.probes ?? CLAUDE_PROBES),
       'PROMPT="$2"',
+      SESSION_CAPTURE,
       `PLAN_FILE=$(printf '%s\n' "$PROMPT" | sed -n 's/^PLAN_FILE: //p' | head -1)`,
       `PAGE_PATH=$(printf '%s\n' "$PROMPT" | sed -n 's/^PAGE_PATH: //p' | head -1)`,
       "mkdir -p ./openwiki",
@@ -156,6 +196,7 @@ export function claudeSessions(parts: {
       ]),
       ...branch('if [ -n "$PAGE_PATH" ]; then', [
         'mkdir -p "$(dirname "./openwiki/$PAGE_PATH")"',
+        SESSION_SIDECAR_CHECK,
         ...(parts.page ?? []),
       ]),
       ...branch('if [ -z "$PAGE_PATH" ]; then', parts.repair),
@@ -356,6 +397,67 @@ export function claudeRateLimitedPool(opts: {
 /** Non-JSON stdout — a CLI whose output contract changed under us. */
 export function claudeGarbageOutput(): Promise<string> {
   return writeShim("claude", [...CLAUDE_PROBES, 'echo "not json at all"', "exit 0"].join("\n"));
+}
+
+/** A page pool for the resume scenarios: what a session does depends on how
+ *  it was invoked — fresh (`--session-id`) or resumed (`--resume`) — so one
+ *  shim serves the interruption run, the resume that follows it, and the
+ *  unresumable fallback. The refusal reproduces the measured CLI shape: a
+ *  plain-text line on stdout, exit 1, no JSON. */
+export function claudeResumePool(opts: {
+  pages: string[];
+  /** A resumed session: finish the page (default), report the usage limit
+   *  again, refuse the resume, or fail terminally with a result payload. */
+  onResume?: "write" | "rateLimit" | "unresumable" | "fail";
+  /** A fresh session: finish the page (default) or stall past the step
+   *  budget, so the run ends with the page unproduced. */
+  onFresh?: "write" | "stall";
+  /** Where each resumed session's full prompt is appended, for asserting the
+   *  continuation contract (the PAGE_PATH header, the interruption note). */
+  prompts?: string;
+}): Promise<string> {
+  const onResume = opts.onResume ?? "write";
+  const onFresh = opts.onFresh ?? "write";
+  const rateLimitPayload = JSON.stringify({
+    is_error: true,
+    terminal_reason: "api_error",
+    api_error_status: 429,
+    result: "Usage limit reached. Resets at 2026-09-01T12:00:00Z.",
+  });
+  const failPayload = JSON.stringify({
+    is_error: true,
+    terminal_reason: "api_error",
+    result: "The model is overloaded. Try again.",
+  });
+  return claudeSessions({
+    plan: opts.pages,
+    ...(opts.prompts === undefined
+      ? {}
+      : {
+          first: [
+            `if [ "$SESS_MODE" = "resume" ] && [ -n "$PAGE_PATH" ]; then`,
+            `  printf '%s\\n' "== $PAGE_PATH ==" >> '${opts.prompts}'`,
+            `  printf '%s\\n' "$PROMPT" >> '${opts.prompts}'`,
+            "fi",
+          ],
+        }),
+    page: [
+      `if [ "$SESS_MODE" = "resume" ] && [ "${onResume}" = "unresumable" ]; then`,
+      '  echo "No conversation found with session ID: $SESS_ID"',
+      "  exit 1",
+      "fi",
+      `if [ "$SESS_MODE" = "resume" ] && [ "${onResume}" = "rateLimit" ]; then`,
+      `  cat <<'JSON'\n${rateLimitPayload}\nJSON`,
+      "  exit 1",
+      "fi",
+      `if [ "$SESS_MODE" = "resume" ] && [ "${onResume}" = "fail" ]; then`,
+      `  cat <<'JSON'\n${failPayload}\nJSON`,
+      "  exit 2",
+      "fi",
+      `if [ "$SESS_MODE" = "new" ] && [ "${onFresh}" = "stall" ]; then sleep 30; fi`,
+      WRITE_PAGE,
+    ],
+  });
 }
 
 /* ── split-planning shims ──────────────────────────────────────────────────

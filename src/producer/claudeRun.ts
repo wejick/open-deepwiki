@@ -11,11 +11,12 @@ import {
   pageDirectives,
   phasePrompt,
   plannerDirectives,
+  probeCapabilities,
   runSession,
   stepOverrides,
-  supportsSettingSources,
   whyNotProduced,
   type Session,
+  type SessionIdentity,
 } from "./claude.ts";
 import { finalizeClaudeBundle } from "./claudeFinalize.ts";
 import { buildDigestTree, listDocumentableFiles, renderDigest } from "./claudeDigest.ts";
@@ -24,9 +25,12 @@ import {
   OVERVIEW_PAGE,
   PLAN_FILE_NAME,
   clearPlanningArtifacts,
+  clearSessionIdentity,
   loadPlan,
   enforcePageBudget,
   normalizePlan,
+  recordedSession,
+  recordSessionIdentity,
   stampPlan,
   type NormalizedPlan,
   type PlanFile,
@@ -101,6 +105,9 @@ export type Run = {
   appliedGlobs: string[];
   /** What is left of the whole-run budget, capped by the per-session budget. */
   stepMs(): number;
+  /** The installed CLI advertised `--session-id` and `--resume`; page
+   *  sessions may carry an identity and be resumed. */
+  sessionFlags: boolean;
   session(
     systemPromptFile: string,
     prompt: string,
@@ -109,6 +116,8 @@ export type Run = {
     /** Abort kills the child early — page workers use it to cancel in-flight
      *  peers when one session reports a usage limit. */
     signal?: AbortSignal,
+    /** Assigned identity for a page session; ignored without sessionFlags. */
+    identity?: SessionIdentity,
   ): Promise<Session>;
   /** Unit-completion beats for the event log. */
   progress(
@@ -182,6 +191,89 @@ async function finalize(bundle: string): Promise<string | null> {
   } catch (err) {
     return `bundle finalization failed: ${String(err)}`;
   }
+}
+
+/** The continuation prompt: the page's ordinary directives against the
+ *  current bundle — fresh link targets — plus the one fact the transcript
+ *  may lack, that the previous session never finished. The first line stays
+ *  `PAGE_PATH:` so `sessionJob` and the test shims parse it unchanged. */
+function continuationPrompt(page: PlanPage, targets: string[], input: ProducerInput): string {
+  return [
+    pageDirectives(page, targets, input),
+    "",
+    "Your previous session for this page was interrupted before the page was finished.",
+    "The page may be missing or half-written on disk: verify what is already there, then finish the page.",
+  ].join("\n");
+}
+
+/** A CLI refusal to resume — measured as `No conversation found with session
+ *  ID: …`, exit 1, no JSON: the transcript is gone. Any non-ok resume WITH a
+ *  payload is that attempt's ordinary result instead. */
+function isUnresumable(s: Session): boolean {
+  if (s.outcome !== "failed" || s.timedOut || s.aborted) return false;
+  if (s.exitCode === null || s.exitCode === 0) return false;
+  try {
+    return typeof (JSON.parse(s.stdout) as { result?: unknown }).result !== "string";
+  } catch {
+    return true;
+  }
+}
+
+/** The record's keep/drop rule, applied to whichever attempt ran: an
+ *  interruption (rate limit, timeout, abort) keeps the identity resumable
+ *  for the next run; producing the page or any terminal failure drops it. */
+function settle(run: Run, page: PlanPage, s: Session): Promise<Session> {
+  if (s.outcome !== "rate_limited" && !s.timedOut && !s.aborted) {
+    return clearSessionIdentity(run.bundle, page.path).then(() => s);
+  }
+  return Promise.resolve(s);
+}
+
+/** One page-session spawn serving both the pool and the overview. The
+ *  identity is assigned and persisted before the child starts, a planned
+ *  page carrying a record resumes its recorded session, and a CLI refusal
+ *  falls back to a fresh session in the same run. A CLI without the flags
+ *  (`sessionFlags: false`) takes exactly the old fresh-session path. */
+async function pageSession(
+  run: Run,
+  page: PlanPage,
+  targets: string[],
+  input: ProducerInput,
+  signal?: AbortSignal,
+): Promise<Session> {
+  const overrides = stepOverrides(run.cfg, "page");
+  const spawnFresh = (identity: SessionIdentity | undefined): Promise<Session> =>
+    run.session(
+      run.prompts.page,
+      pageDirectives(page, targets, input),
+      overrides,
+      undefined,
+      signal,
+      identity,
+    );
+  if (!run.sessionFlags) return spawnFresh(undefined);
+
+  const prior = await recordedSession(run.bundle, page.path);
+  if (prior === null) {
+    const identity: SessionIdentity = { mode: "new", id: crypto.randomUUID() };
+    await recordSessionIdentity(run.bundle, page.path, identity.id);
+    return settle(run, page, await spawnFresh(identity));
+  }
+
+  const resumed = await run.session(
+    run.prompts.page,
+    continuationPrompt(page, targets, input),
+    overrides,
+    undefined,
+    signal,
+    { mode: "resume", id: prior },
+  );
+  if (!isUnresumable(resumed)) return settle(run, page, resumed);
+  run.notes.push(`${page.path}: the recorded session could not be resumed; starting fresh`);
+  await clearSessionIdentity(run.bundle, page.path);
+  const identity: SessionIdentity = { mode: "new", id: crypto.randomUUID() };
+  await recordSessionIdentity(run.bundle, page.path, identity.id);
+  return settle(run, page, await spawnFresh(identity));
 }
 
 /* REPAIR — a targeted fix, not a fresh build: replanning would discard
@@ -417,13 +509,7 @@ async function producePages(
         }
         return;
       }
-      const produced = await run.session(
-        run.prompts.page,
-        pageDirectives(page, await linkTargets(page), input),
-        stepOverrides(run.cfg, "page"),
-        undefined,
-        abort.signal,
-      );
+      const produced = await pageSession(run, page, await linkTargets(page), input, abort.signal);
       sessions[i] = produced;
       if (produced.outcome === "ok" && (await pageIsWritten(run.bundle, page.path))) {
         done[i] = true;
@@ -469,11 +555,7 @@ async function producePages(
         note(noteOf(overview), `out of budget with ${overview.path} and later pages unproduced`);
       }
     } else {
-      const produced = await run.session(
-        run.prompts.page,
-        pageDirectives(overview, await linkTargets(overview), input),
-        stepOverrides(run.cfg, "page"),
-      );
+      const produced = await pageSession(run, overview, await linkTargets(overview), input);
       last = produced;
       if (produced.outcome === "ok" && (await pageIsWritten(run.bundle, overview.path))) {
         run.units++;
@@ -573,13 +655,17 @@ export async function openRun(
   const stepMs = (): number =>
     Math.min(cfg.claude.stepTimeoutSec * 1000, Math.max(0, deadline - Date.now()));
 
-  const extraArgs = (await supportsSettingSources(env, checkoutDir))
-    ? ["--setting-sources", SETTING_SOURCES]
-    : [];
-  if (extraArgs.length === 0) {
+  const caps = await probeCapabilities(env, checkoutDir);
+  const extraArgs = caps.settingSources ? ["--setting-sources", SETTING_SOURCES] : [];
+  if (!caps.settingSources) {
     notes.push(
       "this claude has no --setting-sources: the checkout's own settings files are only " +
         "ignored because the workspace was never trusted",
+    );
+  }
+  if (!caps.sessionFlags) {
+    notes.push(
+      "this claude has no --session-id/--resume: page sessions get no identity and are never resumed",
     );
   }
 
@@ -606,6 +692,7 @@ export async function openRun(
     overrides: { model?: string; effort?: ClaudeEffort } = {},
     tools: string = ALLOWED_TOOLS,
     signal?: AbortSignal,
+    identity?: SessionIdentity,
   ): Promise<Session> => {
     // Before the spawn: a hung session must be the last thing the log shows.
     await progress("session", sessionJob(prompt));
@@ -619,6 +706,7 @@ export async function openRun(
       allowedTools: tools,
       ...overrides,
       ...(signal === undefined ? {} : { signal }),
+      ...(identity === undefined ? {} : { identity }),
     });
   };
 
@@ -640,6 +728,7 @@ export async function openRun(
     notes,
     units: 0,
     appliedGlobs,
+    sessionFlags: caps.sessionFlags,
     stepMs,
     session: spawnSession,
     progress,

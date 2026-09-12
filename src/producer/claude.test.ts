@@ -13,8 +13,8 @@ import {
   areaDirectives,
   phasePrompt,
   plannerDirectives,
+  probeCapabilities,
   runSession,
-  supportsSettingSources,
   whyNotProduced,
 } from "./claude.ts";
 import { runClaude } from "./claudeRun.ts";
@@ -29,6 +29,7 @@ import {
   claudeAlwaysUnacceptable,
   claudeFailsOnePage,
   claudeMalformedBundle,
+  claudeSessions,
   claudeStallsOnOnePage,
   claudeNotLoggedIn,
   claudeRateLimited,
@@ -66,15 +67,17 @@ describe("Non-interactive Claude Code producer invocation", () => {
   test("argv carries the measured flags — prompt file, model, effort, tool policy", async () => {
     const { dir, checkout: c } = await checkout();
     // Record argv instead of running: this asserts the invocation contract.
-    const shim = await writeShim(
-      "claude",
-      [...CLAUDE_PROBES, 'printf "%s\\n" "$@" > "$ODW_ARGV_OUT"', "exit 0"].join("\n"),
-    );
+    // The capture rides every session — planner, pages, overview — since the
+    // identity flags belong to page sessions specifically.
+    const argvOut = join(dir, "argv.txt");
+    const shim = await claudeSessions({
+      plan: ["a.md"],
+      first: ['if [ -n "$ODW_ARGV_OUT" ]; then printf "%s\\n" "$@" >> "$ODW_ARGV_OUT"; fi'],
+    });
     const cfg = testConfig(dir, {
       ODW_CLAUDE_MODEL: "claude-sonnet-5",
       ODW_CLAUDE_EFFORT: "medium",
     });
-    const argvOut = join(dir, "argv.txt");
 
     await runClaude(cfg, "init", c, { env: { PATH: pathWith(shim), ODW_ARGV_OUT: argvOut } });
     const argv = (await readFile(argvOut, "utf8")).split("\n");
@@ -95,6 +98,41 @@ describe("Non-interactive Claude Code producer invocation", () => {
     expect(argv).toContain(DENIED_TOOLS);
     expect(argv).toContain("--setting-sources");
     expect(argv).toContain(SETTING_SOURCES);
+    // A fresh run with a capable CLI: every page session is named, none resumed.
+    expect(argv).toContain("--session-id");
+    expect(argv).not.toContain("--resume");
+  });
+
+  test("runSession names a fresh session and resumes a recorded one — never both", async () => {
+    const { dir, checkout: c } = await checkout();
+    const shim = await writeShim(
+      "claude",
+      [...CLAUDE_PROBES, 'printf "%s\\n" "$@" > "$ODW_ARGV_OUT"', "exit 0"].join("\n"),
+    );
+    const cfg = testConfig(dir);
+    const argvOf = async (identity?: Parameters<typeof runSession>[1]["identity"]) => {
+      const argvOut = join(dir, `argv-${identity?.mode ?? "bare"}.txt`);
+      await runSession(cfg, {
+        systemPromptFile: join(dir, "sys.md"),
+        prompt: "work",
+        cwd: c,
+        env: { PATH: pathWith(shim), ODW_ARGV_OUT: argvOut },
+        timeoutMs: 10_000,
+        extraArgs: [],
+        ...(identity === undefined ? {} : { identity }),
+      });
+      return (await readFile(argvOut, "utf8")).split("\n");
+    };
+
+    expect(await argvOf({ mode: "new", id: "11111111-1111-4111-8111-111111111111" })).toEqual(
+      expect.arrayContaining(["--session-id", "11111111-1111-4111-8111-111111111111"]),
+    );
+    expect(await argvOf({ mode: "resume", id: "22222222-2222-4222-8222-222222222222" })).toEqual(
+      expect.arrayContaining(["--resume", "22222222-2222-4222-8222-222222222222"]),
+    );
+    const bare = await argvOf();
+    expect(bare).not.toContain("--session-id");
+    expect(bare).not.toContain("--resume");
   });
 
   test("a CLI without --setting-sources is not handed it — an unknown option kills every session", async () => {
@@ -114,16 +152,41 @@ describe("Non-interactive Claude Code producer invocation", () => {
     expect(run.stderr).toContain("--setting-sources");
   });
 
-  test("supportsSettingSources reads the CLI's own help, and a missing CLI is a no", async () => {
+  test("probeCapabilities reads both flags off the CLI's own help, and a missing CLI is a no", async () => {
     const modern = await writeShim("claude", CLAUDE_PROBES.join("\n"));
     const legacy = await writeShim("claude", CLAUDE_PROBES_LEGACY.join("\n"));
+    // One flag without the other must not enable identities: naming a session
+    // it cannot resume would strand the record.
+    const half = await writeShim(
+      "claude",
+      [
+        'if [ "$1" = "--help" ]; then',
+        '  echo "  --setting-sources <sources>"',
+        '  echo "  --session-id <uuid>"',
+        "  exit 0",
+        "fi",
+      ].join("\n"),
+    );
     const dir = await makeTmp();
     trackTmp(dir);
     const empty = join(dir, "no-claude-here");
 
-    expect(await supportsSettingSources({ PATH: pathWith(modern) }, dir)).toBe(true);
-    expect(await supportsSettingSources({ PATH: pathWith(legacy) }, dir)).toBe(false);
-    expect(await supportsSettingSources({ PATH: empty }, dir)).toBe(false);
+    expect(await probeCapabilities({ PATH: pathWith(modern) }, dir)).toEqual({
+      settingSources: true,
+      sessionFlags: true,
+    });
+    expect(await probeCapabilities({ PATH: pathWith(legacy) }, dir)).toEqual({
+      settingSources: false,
+      sessionFlags: false,
+    });
+    expect(await probeCapabilities({ PATH: pathWith(half) }, dir)).toEqual({
+      settingSources: true,
+      sessionFlags: false,
+    });
+    expect(await probeCapabilities({ PATH: empty }, dir)).toEqual({
+      settingSources: false,
+      sessionFlags: false,
+    });
   });
 
   test("Bash is denied and the allowlist is read-plus-bundle-write only", () => {

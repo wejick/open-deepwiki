@@ -41,17 +41,22 @@ export const DENIED_TOOLS = "Bash";
 
 export const SETTING_SOURCES = "user";
 
-export async function supportsSettingSources(
+export async function probeCapabilities(
   env: Record<string, string>,
   cwd: string,
-): Promise<boolean> {
+): Promise<{ settingSources: boolean; sessionFlags: boolean }> {
   try {
     const proc = Bun.spawn(["claude", "--help"], { cwd, env, stdout: "pipe", stderr: "pipe" });
     const help = await new Response(proc.stdout).text();
     await proc.exited;
-    return help.includes("--setting-sources");
+    return {
+      settingSources: help.includes("--setting-sources"),
+      // Both must be advertised: naming a session without the resume flag
+      // (or the reverse) would strand identities in the sidecar.
+      sessionFlags: help.includes("--session-id") && help.includes("--resume"),
+    };
   } catch {
-    return false;
+    return { settingSources: false, sessionFlags: false };
   }
 }
 
@@ -317,6 +322,12 @@ export function describeSession(s: Session): string {
   return facts.length > 0 ? facts.join("; ") : "session failed without saying why";
 }
 
+/** A page session's identity, assigned by the producer and persisted before
+ *  the child spawns: `new` names a fresh session (`--session-id`), `resume`
+ *  continues a recorded one (`--resume`). Only passed when the CLI advertised
+ *  both flags — an unknown option is a hard error. */
+export type SessionIdentity = { mode: "new" | "resume"; id: string };
+
 export async function runSession(
   cfg: Config,
   args: {
@@ -333,6 +344,8 @@ export async function runSession(
     allowedTools?: string;
     /** Abort kills the child early (a rate-limited peer ending the run). */
     signal?: AbortSignal;
+    /** The session's assigned identity; absent = unresumed legacy behavior. */
+    identity?: SessionIdentity;
   },
 ): Promise<Session> {
   let proc;
@@ -354,6 +367,11 @@ export async function runSession(
         args.allowedTools ?? ALLOWED_TOOLS,
         "--disallowedTools",
         DENIED_TOOLS,
+        ...(args.identity === undefined
+          ? []
+          : args.identity.mode === "new"
+            ? ["--session-id", args.identity.id]
+            : ["--resume", args.identity.id]),
         ...args.extraArgs,
       ],
       { cwd: args.cwd, env: args.env, stdout: "pipe", stderr: "pipe" },

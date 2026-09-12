@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { RESERVED_NAMES, pageConformance } from "./verify.ts";
 import { protectionReason } from "./claudeDigest.ts";
@@ -890,10 +890,87 @@ export function enforcePageBudget(
 export async function clearPlanningArtifacts(bundleDir: string): Promise<void> {
   const files = await readdir(bundleDir).catch(() => [] as string[]);
   await Promise.all(
-    [MAP_FILE_NAME, ...files.filter((f) => f.startsWith(".odw-plan.part-"))].map((f) =>
-      rm(join(bundleDir, f), { force: true }),
-    ),
+    [
+      MAP_FILE_NAME,
+      SESSIONS_FILE_NAME,
+      SESSIONS_TMP,
+      ...files.filter((f) => f.startsWith(".odw-plan.part-")),
+    ].map((f) => rm(join(bundleDir, f), { force: true })),
   );
+}
+
+/* ── page-session identities ───────────────────────────────────────────────
+ * A page session killed mid-flight — usage limit, timeout, peer abort —
+ * emits no result payload, so its session id can never be scraped after the
+ * fact. It is instead assigned before the child spawns and persisted here,
+ * so a later run can continue that exact session with `claude -p --resume`.
+ * A sidecar rather than a plan field: a corrupt record costs one resume,
+ * never the plan parse (an invalid plan replans, which deletes pages).
+ */
+
+/** A dot-file, like the plan — invisible to everything that walks pages. */
+export const SESSIONS_FILE_NAME = ".odw-sessions.json";
+
+const SESSIONS_TMP = `${SESSIONS_FILE_NAME}.tmp`;
+
+async function readSessionRecords(bundleDir: string): Promise<Record<string, string>> {
+  const raw = await readFile(join(bundleDir, SESSIONS_FILE_NAME), "utf8").catch(() => null);
+  if (raw === null) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+    const records: Record<string, string> = {};
+    for (const [page, id] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof id === "string") records[page] = id;
+    }
+    return records;
+  } catch {
+    return {};
+  }
+}
+
+/** The identity recorded for a page, or null. */
+export async function recordedSession(bundleDir: string, pagePath: string): Promise<string | null> {
+  return (await readSessionRecords(bundleDir))[pagePath] ?? null;
+}
+
+/* Up to `pageWorkers` update the sidecar concurrently; a bare
+ * read-modify-write from two workers would lose records, so every update
+ * rides one promise chain. The write itself is temp+rename atomic, so a kill
+ * mid-write leaves the previous records intact. */
+let sidecarChain = Promise.resolve();
+function updateSessionRecords(
+  bundleDir: string,
+  update: (records: Record<string, string>) => Record<string, string>,
+): Promise<void> {
+  const next = sidecarChain.then(async () => {
+    const updated = update(await readSessionRecords(bundleDir));
+    const tmp = join(bundleDir, SESSIONS_TMP);
+    await writeFile(tmp, `${JSON.stringify(updated, null, 2)}\n`);
+    await rename(tmp, join(bundleDir, SESSIONS_FILE_NAME));
+  });
+  sidecarChain = next.catch(() => {});
+  return next;
+}
+
+/** Record a page's session identity — always called before that session
+ *  spawns, so a kill cannot cost the record. */
+export function recordSessionIdentity(
+  bundleDir: string,
+  pagePath: string,
+  id: string,
+): Promise<void> {
+  return updateSessionRecords(bundleDir, (records) => ({ ...records, [pagePath]: id }));
+}
+
+/** Drop a page's record: the page was produced, or its session ended in a
+ *  terminal failure — either way the next attempt starts fresh. */
+export function clearSessionIdentity(bundleDir: string, pagePath: string): Promise<void> {
+  return updateSessionRecords(bundleDir, (records) => {
+    if (!(pagePath in records)) return records;
+    const { [pagePath]: _dropped, ...rest } = records;
+    return rest;
+  });
 }
 
 /* ── progress: the read-time count of the durable planning/page units ────── */
