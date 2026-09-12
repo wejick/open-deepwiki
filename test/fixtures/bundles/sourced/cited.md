@@ -17,4 +17,10 @@ sources:
 
 # Cited Page
 
-Body text with citations.
+Body text with citations. The hook (`src/auth.ts:10-20`) runs, and so does
+(`src/auth.ts:8`); the hash form (`src/auth.ts#L5-L7`) links too. A typo
+(`src/missing.ts:1-2`) stays plain, as does `session.execution.succeeded`.
+
+```
+src/auth.ts:1-2
+```

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { cp, mkdir, rm } from "node:fs/promises";
+import { cp, mkdir, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Client as DbClient } from "@libsql/client";
 import { startServer, type ServeResult } from "./server.ts";
 import {
@@ -170,6 +170,7 @@ async function serveWiki(
     bundle?: string;
     source?: string;
     lastIndexedSha?: string | null;
+    files?: Record<string, string>;
   } = {},
 ): Promise<{ cfg: Config; served: ServeResult; checkout: string | null }> {
   const dir = await makeTmp();
@@ -194,6 +195,11 @@ async function serveWiki(
     await cp(bundleFixture(opts.bundle ?? "openwiki-authored"), join(checkout, "openwiki"), {
       recursive: true,
     });
+    for (const [rel, content] of Object.entries(opts.files ?? {})) {
+      const target = join(checkout, rel);
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, content);
+    }
     await indexRepo(db, cfg, REPO_ID, checkout);
     repos = [
       {
@@ -367,6 +373,57 @@ describe("Page sources rendered with forge links", () => {
     const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/cited`)).text();
     expect(body).toContain("<code>src/a&amp;b&lt;c&gt;.ts:1</code>");
     expect(body).toContain("src/a%26b%3Cc%3E.ts#L1");
+  });
+});
+
+describe("Inline source citations linked", () => {
+  const FILE = "export const x = 1;\n";
+
+  test("inline mention links to the forge at the indexed revision", async () => {
+    const { served } = await serveWiki({ bundle: "sourced", files: { "src/auth.ts": FILE } });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/cited`)).text();
+    expect(body).toContain(
+      '<a href="https://gitlab.corp/team/repo/-/blob/abc1234/src/auth.ts#L10-20"><code>src/auth.ts:10-20</code></a>',
+    );
+    expect(body).toContain(
+      '<a href="https://gitlab.corp/team/repo/-/blob/abc1234/src/auth.ts#L5-7"><code>src/auth.ts#L5-L7</code></a>',
+    );
+  });
+
+  test("GitHub mention uses the GitHub fragment form", async () => {
+    const { served } = await serveWiki({
+      bundle: "sourced",
+      source: "git@github.com:team/repo.git",
+      files: { "src/auth.ts": FILE },
+    });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/cited`)).text();
+    expect(body).toContain('href="https://github.com/team/repo/blob/abc1234/src/auth.ts#L10-L20"');
+  });
+
+  test("single-line mention", async () => {
+    const { served } = await serveWiki({ bundle: "sourced", files: { "src/auth.ts": FILE } });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/cited`)).text();
+    expect(body).toContain('href="https://gitlab.corp/team/repo/-/blob/abc1234/src/auth.ts#L8"');
+  });
+
+  test("missing file, fenced block, and identifier stay plain", async () => {
+    const { served } = await serveWiki({ bundle: "sourced", files: { "src/auth.ts": FILE } });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/cited`)).text();
+    expect(body).toContain("<code>src/missing.ts:1-2</code>");
+    expect(body).not.toContain("src/missing.ts#L1-2");
+    expect(body).not.toContain("src/auth.ts#L1-2"); // fenced block, not a citation
+    expect(body).toContain("<code>session.execution.succeeded</code>");
+  });
+
+  test("local repo keeps inline mentions plain", async () => {
+    const { served } = await serveWiki({
+      bundle: "sourced",
+      source: "/srv/code/repo",
+      files: { "src/auth.ts": FILE },
+    });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/cited`)).text();
+    expect(body).toContain("<code>src/auth.ts:10-20</code>");
+    expect(body).not.toContain("src/auth.ts:10-20</a>");
   });
 });
 

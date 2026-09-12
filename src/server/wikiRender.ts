@@ -51,6 +51,8 @@ export type RenderEnv = Env & {
   fromDir: string;
   /** Every concept id in this repo's wiki, for link resolution. */
   conceptIds: Set<string>;
+  /** Inline code span text -> forge URL; a matching span renders as a link. */
+  sourceLinks?: ReadonlyMap<string, string>;
 };
 
 export function escapeHtml(s: string): string {
@@ -62,6 +64,25 @@ export function escapeAttr(s: string): string {
 }
 
 const EXTERNAL_HREF_RE = /^[a-z][a-z0-9+.-]*:/i; // scheme:... (http:, https:, mailto:, ...)
+
+/** A body citation: repo-relative `path:start-end`, `path:start`,
+ *  `path#Lstart-Lend`, or `path#Lstart` — and nothing else; a bare path-like
+ *  span is not enough to claim citation. */
+const INLINE_CITATION_RE =
+  /^([A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]+)(?::(\d+)(?:-(\d+))?|#L(\d+)(?:-L?(\d+))?)$/;
+
+export function parseInlineCitation(
+  text: string,
+): { path: string; range: { start: number; end: number } } | null {
+  const m = INLINE_CITATION_RE.exec(text);
+  if (m === null) return null;
+  const startRaw = m[2] ?? m[4];
+  if (startRaw === undefined) return null;
+  const endRaw = m[3] ?? m[5];
+  const start = Number(startRaw);
+  const end = endRaw === undefined ? start : Number(endRaw);
+  return { path: m[1]!, range: { start, end } };
+}
 
 let mdPromise: Promise<MarkdownIt> | null = null;
 
@@ -89,6 +110,13 @@ async function buildWikiMarkdown(): Promise<MarkdownIt> {
       themes: SHIKI_THEMES,
       defaultColor: false,
     });
+  };
+
+  md.renderer.rules.code_inline = (tokens, idx, _options, env) => {
+    const token = tokens[idx]!;
+    const href = (env as RenderEnv | undefined)?.sourceLinks?.get(token.content);
+    const code = `<code>${escapeHtml(token.content)}</code>`;
+    return href === undefined ? code : `<a href="${escapeAttr(href)}">${code}</a>`;
   };
 
   md.renderer.rules.link_open = (tokens, idx, options, env, self) => {

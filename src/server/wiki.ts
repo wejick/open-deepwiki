@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
+import { statSync } from "node:fs";
 import { join, resolve as resolvePath, sep } from "node:path";
 import type { Client } from "@libsql/client";
 import matter from "gray-matter";
@@ -14,6 +15,7 @@ import {
   escapeAttr,
   escapeHtml,
   hasMermaidDiagram,
+  parseInlineCitation,
   type RenderEnv,
 } from "./wikiRender.ts";
 
@@ -138,6 +140,34 @@ export function renderSources(
   }
   if (items.length === 0) return "";
   return `<section class="sources"><h2>Sources</h2><ul>${items.join("")}</ul></section>`;
+}
+
+/** Inline `path:start-end` code spans resolved to forge permalinks, keyed by
+ *  the span's exact text. A mention links only when its path is a real file in
+ *  the checkout, so references to other repos or dependencies stay plain
+ *  (spec: wiki-viewer › Inline source citations linked). */
+export function inlineSourceLinks(
+  body: string,
+  repo: Pick<RepoRecord, "clonePath" | "source" | "lastIndexedSha">,
+): Map<string, string> {
+  const links = new Map<string, string>();
+  const root = resolvePath(repo.clonePath);
+  for (const match of body.matchAll(/`([^`\n]+)`/g)) {
+    const raw = match[1];
+    if (raw === undefined || raw === "" || links.has(raw)) continue;
+    const citation = parseInlineCitation(raw);
+    if (citation === null) continue;
+    const abs = resolvePath(root, citation.path);
+    if (!abs.startsWith(root + sep)) continue;
+    try {
+      if (!statSync(abs).isFile()) continue;
+    } catch {
+      continue;
+    }
+    const href = webSourceUrl(repo.source, repo.lastIndexedSha, citation.path, citation.range);
+    if (href !== null) links.set(raw, href);
+  }
+  return links;
 }
 
 export function renderShell(opts: {
@@ -320,6 +350,7 @@ async function renderConceptPage(
     repoId: repo.repoId,
     fromDir,
     conceptIds: await conceptIdSet(db, repo.repoId),
+    sourceLinks: inlineSourceLinks(parsed.content, repo),
   };
   const html = md.render(parsed.content, env) + renderSources(parsed.data, repo);
   const title =

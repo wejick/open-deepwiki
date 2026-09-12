@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { createWikiMarkdown, hasMermaidDiagram, type RenderEnv } from "./wikiRender.ts";
+import {
+  createWikiMarkdown,
+  hasMermaidDiagram,
+  parseInlineCitation,
+  type RenderEnv,
+} from "./wikiRender.ts";
 
 function env(overrides: Partial<RenderEnv> = {}): RenderEnv {
   return { repoId: "testrepo", fromDir: "", conceptIds: new Set(), ...overrides };
@@ -87,5 +92,72 @@ describe("Cross-page link resolution", () => {
     const md = await createWikiMarkdown();
     const html = md.render("[missing](nope.md)\n", env());
     expect(html).toContain('href="nope.md"');
+  });
+});
+
+describe("parseInlineCitation", () => {
+  test("ranged mention", () => {
+    expect(parseInlineCitation("goal.ts:633-661")).toEqual({
+      path: "goal.ts",
+      range: { start: 633, end: 661 },
+    });
+  });
+
+  test("single-line mention", () => {
+    expect(parseInlineCitation("src/auth.ts:8")).toEqual({
+      path: "src/auth.ts",
+      range: { start: 8, end: 8 },
+    });
+  });
+
+  test("hash-form mention", () => {
+    expect(parseInlineCitation("goal.ts#L71-L86")).toEqual({
+      path: "goal.ts",
+      range: { start: 71, end: 86 },
+    });
+    expect(parseInlineCitation("goal.ts#L20")).toEqual({
+      path: "goal.ts",
+      range: { start: 20, end: 20 },
+    });
+  });
+
+  test("non-citations are null", () => {
+    expect(parseInlineCitation("session.execution.succeeded")).toBeNull();
+    expect(parseInlineCitation("package.json")).toBeNull();
+    expect(parseInlineCitation("https://github.com/x/y.ts:3")).toBeNull();
+    expect(parseInlineCitation("not-a-path:1-2")).toBeNull();
+  });
+});
+
+describe("Inline source citations linked", () => {
+  test("a mapped mention renders as an anchor around its code", async () => {
+    const md = await createWikiMarkdown();
+    const html = md.render("Hook (`goal.ts:633-661`) runs.\n", {
+      ...env(),
+      sourceLinks: new Map([
+        ["goal.ts:633-661", "https://github.com/team/repo/blob/abc/goal.ts#L633-L661"],
+      ]),
+    });
+    expect(html).toContain(
+      '<a href="https://github.com/team/repo/blob/abc/goal.ts#L633-L661"><code>goal.ts:633-661</code></a>',
+    );
+  });
+
+  test("without a map entry the span stays plain code", async () => {
+    const md = await createWikiMarkdown();
+    const html = md.render("Hook (`goal.ts:633-661`) runs.\n", env());
+    expect(html).toContain("<code>goal.ts:633-661</code>");
+    expect(html).not.toContain("<a ");
+  });
+
+  test("a fenced block is never linked, map or not", async () => {
+    const md = await createWikiMarkdown();
+    const html = md.render("```\ngoal.ts:633-661\n```\n", {
+      ...env(),
+      sourceLinks: new Map([
+        ["goal.ts:633-661", "https://github.com/team/repo/blob/abc/goal.ts#L633-L661"],
+      ]),
+    });
+    expect(html).not.toContain("<a ");
   });
 });
