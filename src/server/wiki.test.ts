@@ -163,7 +163,14 @@ async function freePort(): Promise<number> {
 const REPO_ID = "gitlab.corp/team/repo";
 
 async function serveWiki(
-  opts: { bindHost?: string; token?: string; empty?: boolean } = {},
+  opts: {
+    bindHost?: string;
+    token?: string;
+    empty?: boolean;
+    bundle?: string;
+    source?: string;
+    lastIndexedSha?: string | null;
+  } = {},
 ): Promise<{ cfg: Config; served: ServeResult; checkout: string | null }> {
   const dir = await makeTmp();
   tmpDirs.push(dir);
@@ -184,12 +191,14 @@ async function serveWiki(
     const checkout = join(dir, "repos", REPO_ID, "checkout");
     checkoutDir = checkout;
     await mkdir(checkout, { recursive: true });
-    await cp(bundleFixture("openwiki-authored"), join(checkout, "openwiki"), { recursive: true });
+    await cp(bundleFixture(opts.bundle ?? "openwiki-authored"), join(checkout, "openwiki"), {
+      recursive: true,
+    });
     await indexRepo(db, cfg, REPO_ID, checkout);
     repos = [
       {
         repoId: REPO_ID,
-        source: "git@gitlab.corp:team/repo.git",
+        source: opts.source ?? "git@gitlab.corp:team/repo.git",
         clonePath: checkout,
         addedAt: new Date().toISOString(),
         schedule: null,
@@ -204,7 +213,7 @@ async function serveWiki(
           tokens: null,
           error: null,
         },
-        lastIndexedSha: "abc1234",
+        lastIndexedSha: opts.lastIndexedSha === undefined ? "abc1234" : opts.lastIndexedSha,
         lastSuccessAt: new Date().toISOString(),
       },
     ];
@@ -290,6 +299,74 @@ describe("Rendered page content", () => {
     expect(body).toContain("shiki"); // the fenced `sh` block
     expect(body).toContain('<pre class="mermaid">'); // the mermaid fence
     expect(body).toContain("mermaid.esm.min.mjs"); // bootstrap only loads because a diagram is present
+  });
+});
+
+describe("Page sources rendered with forge links", () => {
+  test("GitLab citation linked", async () => {
+    const { served } = await serveWiki({ bundle: "sourced" });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/cited`)).text();
+    expect(body).toContain(
+      'href="https://gitlab.corp/team/repo/-/blob/abc1234/src/auth.ts#L10-20"',
+    );
+    expect(body).toContain("<code>src/auth.ts:10-20</code>");
+  });
+
+  test("GitHub citation linked", async () => {
+    const { served } = await serveWiki({
+      bundle: "sourced",
+      source: "git@github.com:team/repo.git",
+    });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/cited`)).text();
+    expect(body).toContain('href="https://github.com/team/repo/blob/abc1234/src/auth.ts#L10-L20"');
+  });
+
+  test("File citation without a line range", async () => {
+    const { served } = await serveWiki({ bundle: "sourced" });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/cited`)).text();
+    expect(body).toContain('href="https://gitlab.corp/team/repo/-/blob/abc1234/README.md"');
+    expect(body).not.toContain("README.md#");
+  });
+
+  test("Single-line citation", async () => {
+    const { served } = await serveWiki({ bundle: "sourced" });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/cited`)).text();
+    expect(body).toContain('href="https://gitlab.corp/team/repo/-/blob/abc1234/src/auth.ts#L8"');
+  });
+
+  test("Unlinkable repository degrades to text", async () => {
+    const { served } = await serveWiki({ bundle: "sourced", source: "/srv/code/repo" });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/cited`)).text();
+    expect(body).toContain("<code>src/auth.ts:10-20</code>");
+    expect(body).not.toContain("https://");
+  });
+
+  test("Unindexed repository degrades to text", async () => {
+    const { served } = await serveWiki({ bundle: "sourced", lastIndexedSha: null });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/cited`)).text();
+    expect(body).toContain("<code>src/auth.ts:10-20</code>");
+    expect(body).not.toContain("https://gitlab.corp");
+  });
+
+  test("Non-repo resources and pages without sources", async () => {
+    const { served } = await serveWiki({ bundle: "sourced" });
+    const cited = await (await fetch(`${served.url}/wiki/${REPO_ID}/cited`)).text();
+    expect(cited).not.toContain("example.com");
+    const plain = await (await fetch(`${served.url}/wiki/${REPO_ID}/plain`)).text();
+    expect(plain).not.toContain('class="sources"');
+  });
+
+  test("real bundle page sources link at the indexed revision", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/concepts/two-modes`)).text();
+    expect(body).toContain('href="https://gitlab.corp/team/repo/-/blob/abc1234/README.md"');
+  });
+
+  test("entry text and href are escaped", async () => {
+    const { served } = await serveWiki({ bundle: "sourced" });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/cited`)).text();
+    expect(body).toContain("<code>src/a&amp;b&lt;c&gt;.ts:1</code>");
+    expect(body).toContain("src/a%26b%3Cc%3E.ts#L1");
   });
 });
 

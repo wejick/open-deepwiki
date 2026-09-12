@@ -317,22 +317,40 @@ export function getRepo(registry: Registry, repoId: string): RepoRecord | undefi
 }
 
 /**
- * Stable unique repoId as a `host/group/name` slug: remote URLs normalize to
- * `<host>/<group-path>` (GitLab-subgroup-safe); local paths become
- * `local/<basename>`. Collisions are suffixed (-2, -3, ...).
+ * Host and group path of a remote source, case preserved:
+ * `git@gitlab.corp:team/repo.git` parses to
+ * `{ host: "gitlab.corp", path: "team/repo" }`. Local paths return null.
+ * Case matters to forge URLs (repo paths are case-sensitive), so lowering for
+ * ids stays with the callers that need it.
  */
-export function repoIdFromSource(source: string): string {
+export function parseRemote(source: string): { host: string; path: string } | null {
   const s = source
     .trim()
     .replace(/\.git$/, "")
     .replace(/\/+$/, "");
   const scp = /^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^/@]+@)?([^/:]+)(?::\d+)?[:/](.+)$/i.exec(s);
-  if (scp) {
-    const host = (scp[1] ?? "").toLowerCase();
-    const path = (scp[2] ?? "").replace(/^\/+/, "").toLowerCase();
-    return `${host}/${path}`;
-  }
-  const name = s.split("/").findLast(Boolean) ?? "repo";
+  if (!scp) return null;
+  const host = scp[1] ?? "";
+  const path = (scp[2] ?? "").replace(/^\/+/, "");
+  if (host === "" || path === "") return null;
+  return { host, path };
+}
+
+/**
+ * Stable unique repoId as a `host/group/name` slug: remote URLs normalize to
+ * `<host>/<group-path>` (GitLab-subgroup-safe); local paths become
+ * `local/<basename>`. Collisions are suffixed (-2, -3, ...).
+ */
+export function repoIdFromSource(source: string): string {
+  const remote = parseRemote(source);
+  if (remote) return `${remote.host.toLowerCase()}/${remote.path.toLowerCase()}`;
+  const name =
+    source
+      .trim()
+      .replace(/\.git$/, "")
+      .replace(/\/+$/, "")
+      .split("/")
+      .findLast(Boolean) ?? "repo";
   return `local/${name}`;
 }
 

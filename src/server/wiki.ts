@@ -6,7 +6,9 @@ import matter from "gray-matter";
 import type { Config } from "../config/config.ts";
 import { getChunk, listChunks } from "../index/db.ts";
 import { NO_MATTER_CACHE, bundleDir } from "../producer/verify.ts";
+import { citedPath, lineRangeOf } from "../producer/grounding.ts";
 import type { Registry, RepoRecord } from "../repoManager/registry.ts";
+import { webSourceUrl } from "../repoManager/webLinks.ts";
 import {
   createWikiMarkdown,
   escapeAttr,
@@ -104,6 +106,40 @@ export function renderRepoListBody(repos: Pick<RepoRecord, "repoId">[]): string 
   return `<ul class="repo-list">${items}</ul>`;
 }
 
+/** Frontmatter `sources` as a linked footer: `repo://` citations link to the
+ *  forge at the indexed revision when one is derivable and render as plain
+ *  `path:range` text otherwise; non-repo resources are omitted (spec:
+ *  wiki-viewer › Page sources rendered with forge links). */
+export function renderSources(
+  frontmatter: Record<string, unknown>,
+  repo: Pick<RepoRecord, "source" | "lastIndexedSha">,
+): string {
+  const sources = frontmatter.sources;
+  if (!Array.isArray(sources)) return "";
+  const items: string[] = [];
+  for (const entry of sources) {
+    if (entry === null || typeof entry !== "object") continue;
+    const resource = (entry as { resource?: unknown }).resource;
+    const path = citedPath(resource);
+    if (path === null) continue;
+    const range = lineRangeOf(resource);
+    const label =
+      range === null
+        ? path
+        : range.start === range.end
+          ? `${path}:${range.start}`
+          : `${path}:${range.start}-${range.end}`;
+    const href = webSourceUrl(repo.source, repo.lastIndexedSha, path, range);
+    items.push(
+      href === null
+        ? `<li><code>${escapeHtml(label)}</code></li>`
+        : `<li><a href="${escapeAttr(href)}"><code>${escapeHtml(label)}</code></a></li>`,
+    );
+  }
+  if (items.length === 0) return "";
+  return `<section class="sources"><h2>Sources</h2><ul>${items.join("")}</ul></section>`;
+}
+
 export function renderShell(opts: {
   title: string;
   breadcrumb: Crumb[];
@@ -180,6 +216,9 @@ body {
 .content th, .content td { border: 1px solid var(--border); padding: 0.4rem 0.6rem; text-align: left; }
 .repo-list { list-style: none; padding: 0; }
 .repo-list li { padding: 0.35rem 0; border-bottom: 1px solid var(--border); }
+.content .sources { margin-top: 2.5rem; border-top: 1px solid var(--border); }
+.content .sources h2 { font-size: 1rem; color: var(--muted); }
+.content .sources ul { padding-left: 1.25rem; }
 `;
 
 const MERMAID_BOOTSTRAP = `<script type="module">
@@ -282,7 +321,7 @@ async function renderConceptPage(
     fromDir,
     conceptIds: await conceptIdSet(db, repo.repoId),
   };
-  const html = md.render(parsed.content, env);
+  const html = md.render(parsed.content, env) + renderSources(parsed.data, repo);
   const title =
     typeof parsed.data.title === "string" ? parsed.data.title : (path.split("/").at(-1) ?? path);
   return { html, title };

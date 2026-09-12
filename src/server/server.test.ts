@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { decode } from "@toon-format/toon";
 import type { Client as DbClient } from "@libsql/client";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -66,7 +66,16 @@ async function connectMCP(mcpUrl: string, token?: string): Promise<Client> {
 
 /** Index a fixture repo and serve it over loopback HTTP. */
 async function serveFixture(
-  opts: { bindHost?: string; token?: string; repoId?: string; env?: Record<string, string> } = {},
+  opts: {
+    bindHost?: string;
+    token?: string;
+    repoId?: string;
+    env?: Record<string, string>;
+    bundle?: string;
+    source?: string;
+    lastIndexedSha?: string | null;
+    files?: Record<string, string>;
+  } = {},
 ): Promise<{
   cfg: Config;
   db: DbClient;
@@ -90,12 +99,17 @@ async function serveFixture(
   const repoId = opts.repoId ?? "gitlab.corp/team/repo";
   const checkout = join(dir, "repos", repoId, "checkout");
   await mkdir(checkout, { recursive: true });
-  await cp(bundleFixture("valid"), join(checkout, "openwiki"), { recursive: true });
+  await cp(bundleFixture(opts.bundle ?? "valid"), join(checkout, "openwiki"), { recursive: true });
+  for (const [rel, content] of Object.entries(opts.files ?? {})) {
+    const target = join(checkout, rel);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, content);
+  }
   await indexRepo(db, cfg, repoId, checkout);
 
   const record: RepoRecord = {
     repoId,
-    source: "git@gitlab.corp:team/repo.git",
+    source: opts.source ?? "git@gitlab.corp:team/repo.git",
     clonePath: checkout,
     addedAt: new Date().toISOString(),
     schedule: null,
@@ -110,7 +124,7 @@ async function serveFixture(
       tokens: null,
       error: null,
     },
-    lastIndexedSha: "abc1234",
+    lastIndexedSha: opts.lastIndexedSha === undefined ? "abc1234" : opts.lastIndexedSha,
     lastSuccessAt: new Date().toISOString(),
   };
   const registry: Registry = { repos: [record] };
@@ -230,6 +244,157 @@ describe("MCP tools", () => {
     const text = String((res.content as { text?: string }[])[0]?.text ?? "");
     expect(text).toContain("token-validation");
     expect(text).toContain("gitlab.corp/team/repo");
+    await client.close();
+  });
+
+  const SOURCE_FILE =
+    "export const validateToken = (t: string): boolean => t.length > 0;\nexport default validateToken;";
+
+  async function decodedSearch(
+    served: ServeResult,
+    args: Record<string, unknown>,
+  ): Promise<{ results: { repoId?: string; path: string; kind: string; url: string | null }[] }> {
+    const client = await connectMCP(served.mcpUrl);
+    const res = await client.callTool({ name: "search_code", arguments: args });
+    expect(res.isError).toBeUndefined();
+    const text = String((res.content as { text?: string }[])[0]?.text ?? "");
+    await client.close();
+    return decode(text, { strict: true }) as {
+      results: { repoId?: string; path: string; kind: string; url: string | null }[];
+    };
+  }
+
+  test("Source result carries a GitLab permalink", async () => {
+    const { served } = await serveFixture({ files: { "src/auth.ts": SOURCE_FILE } });
+    const parsed = await decodedSearch(served, {
+      repoId: "gitlab.corp/team/repo",
+      query: "validateToken",
+      limit: 10,
+    });
+    const hit = parsed.results.find((r) => r.path === "src/auth.ts");
+    expect(hit?.kind).toBe("source");
+    expect(hit?.url).toBe("https://gitlab.corp/team/repo/-/blob/abc1234/src/auth.ts#L1-2");
+  });
+
+  test("Source result carries a GitHub permalink", async () => {
+    const { served } = await serveFixture({
+      source: "git@github.com:team/repo.git",
+      files: { "src/auth.ts": SOURCE_FILE },
+    });
+    const parsed = await decodedSearch(served, {
+      repoId: "gitlab.corp/team/repo",
+      query: "validateToken",
+      limit: 10,
+    });
+    const hit = parsed.results.find((r) => r.path === "src/auth.ts");
+    expect(hit?.url).toBe("https://github.com/team/repo/blob/abc1234/src/auth.ts#L1-L2");
+  });
+
+  test("Unlinkable repo yields a null url", async () => {
+    const { served } = await serveFixture({
+      source: "/srv/code/repo",
+      files: { "src/auth.ts": SOURCE_FILE },
+    });
+    const parsed = await decodedSearch(served, {
+      repoId: "gitlab.corp/team/repo",
+      query: "validateToken",
+      limit: 10,
+    });
+    expect(parsed.results.find((r) => r.path === "src/auth.ts")?.url).toBeNull();
+  });
+
+  test("Unindexed revision yields a null url", async () => {
+    const { served } = await serveFixture({
+      lastIndexedSha: null,
+      files: { "src/auth.ts": SOURCE_FILE },
+    });
+    const parsed = await decodedSearch(served, {
+      repoId: "gitlab.corp/team/repo",
+      query: "validateToken",
+      limit: 10,
+    });
+    expect(parsed.results.find((r) => r.path === "src/auth.ts")?.url).toBeNull();
+  });
+
+  test("Wiki-kind result has no forge URL", async () => {
+    const { served } = await serveFixture();
+    const parsed = await decodedSearch(served, {
+      repoId: "gitlab.corp/team/repo",
+      query: "bearer",
+      limit: 10,
+    });
+    const wiki = parsed.results.filter((r) => r.kind === "wiki");
+    expect(wiki.length).toBeGreaterThan(0);
+    for (const r of wiki) expect(r.url).toBeNull();
+  });
+
+  test("Cross-repo results link to their own repo", async () => {
+    const dir = await makeTmp();
+    tmpDirs.push(dir);
+    const port = await freePort();
+    const cfg = testConfig(dir, { ODW_PORT: String(port) });
+    const db = await openDb(paths.indexDb(cfg), { dim: cfg.embedding.dim });
+    dbs.push(db);
+    const stub = stubFakeVecEmbeddings(cfg.embedding.dim);
+    cleanups.push(stub.restore);
+
+    const repos: RepoRecord[] = [];
+    for (const [repoId, source, file] of [
+      ["repoA", "git@gitlab.corp:team/a.git", "src/auth.ts"],
+      ["repoB", "git@github.com:team/b.git", "src/other.ts"],
+    ] as const) {
+      const checkout = join(dir, "repos", repoId, "checkout");
+      await mkdir(checkout, { recursive: true });
+      await cp(bundleFixture("valid"), join(checkout, "openwiki"), { recursive: true });
+      await mkdir(dirname(join(checkout, file)), { recursive: true });
+      await writeFile(join(checkout, file), SOURCE_FILE);
+      await indexRepo(db, cfg, repoId, checkout);
+      repos.push({
+        repoId,
+        source,
+        clonePath: checkout,
+        addedAt: new Date().toISOString(),
+        schedule: null,
+        instructions: undefined,
+        producer: undefined,
+        options: {},
+        lastRun: {
+          startedAt: null,
+          finishedAt: null,
+          outcome: "success",
+          durationMs: 1,
+          tokens: null,
+          error: null,
+        },
+        lastIndexedSha: "sha",
+        lastSuccessAt: new Date().toISOString(),
+      });
+    }
+    const served = await startServer({ cfg, db, registry: { repos } });
+    servers.push(served);
+
+    const parsed = await decodedSearch(served, { query: "validateToken", limit: 10 });
+    const gitlabHit = parsed.results.find((r) => r.repoId === "repoA" && r.kind === "source");
+    const githubHit = parsed.results.find((r) => r.repoId === "repoB" && r.kind === "source");
+    expect(gitlabHit?.url).toBe("https://gitlab.corp/team/a/-/blob/sha/src/auth.ts#L1-2");
+    expect(githubHit?.url).toBe("https://github.com/team/b/blob/sha/src/other.ts#L1-L2");
+  });
+
+  test("ask_repo source result carries a permalink", async () => {
+    const { served } = await serveFixture({ files: { "src/auth.ts": SOURCE_FILE } });
+    const client = await connectMCP(served.mcpUrl);
+    const res = await client.callTool({
+      name: "ask_repo",
+      arguments: {
+        repoId: "gitlab.corp/team/repo",
+        question: "validate token length",
+        keywords: ["validateToken"],
+        limit: 5,
+      },
+    });
+    expect(res.isError).toBeUndefined();
+    const text = String((res.content as { text?: string }[])[0]?.text ?? "");
+    expect(text).toContain("https://gitlab.corp/team/repo/-/blob/abc1234/src/auth.ts#L1-2");
     await client.close();
   });
 

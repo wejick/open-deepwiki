@@ -12,7 +12,8 @@ import {
 } from "../index/db.ts";
 import { hybridSearch, type SearchHit } from "../index/search.ts";
 import type { StatusSummary } from "../monitor/status.ts";
-import { effectiveExcludes, type Registry } from "../repoManager/registry.ts";
+import { effectiveExcludes, type Registry, type RepoRecord } from "../repoManager/registry.ts";
+import { webSourceUrl } from "../repoManager/webLinks.ts";
 
 /**
  * MCP tool handlers — recall-only: ranked identifiers, snippets, citations.
@@ -59,34 +60,52 @@ const round3 = (v: number) => Math.round(v * 1000) / 1000;
  * merged list; the rest ride the global config alone (represented by their
  * absence from the map, so the common fleet stays a single rg invocation).
  */
-async function repoExcludesFor(deps: ToolDeps): Promise<Map<string, string[]> | undefined> {
-  const registry = await deps.getRegistry();
+function repoExcludesFor(cfg: Config, registry: Registry): Map<string, string[]> | undefined {
   const map = new Map<string, string[]>();
   for (const repo of registry.repos) {
     if (repo.excludeGlobs?.length) {
-      map.set(repo.repoId, effectiveExcludes(deps.cfg, repo));
+      map.set(repo.repoId, effectiveExcludes(cfg, repo));
     }
   }
   return map.size > 0 ? map : undefined;
 }
 
+/** repoId -> the fields a forge permalink needs (source + indexed revision). */
+function repoWebOf(registry: Registry): Map<string, Pick<RepoRecord, "source" | "lastIndexedSha">> {
+  return new Map(
+    registry.repos.map((r) => [r.repoId, { source: r.source, lastIndexedSha: r.lastIndexedSha }]),
+  );
+}
+
 /**
- * Serialize search hits for the wire: round scores, and when the query was
- * scoped to one repo, hoist attribution to the payload's top-level repoId
- * instead of repeating it per result.
+ * Serialize search hits for the wire: round scores, attach a forge permalink
+ * for source-kind results when the repo's source and indexed revision yield
+ * one, and when the query was scoped to one repo, hoist attribution to the
+ * payload's top-level repoId instead of repeating it per result.
  */
-function serializeHits(results: SearchHit[], scoped: boolean) {
-  return results.map((r) => ({
-    ...(scoped ? {} : { repoId: r.repoId }),
-    path: r.path,
-    kind: r.kind,
-    title: r.title,
-    description: r.description,
-    snippet: r.snippet,
-    score: round3(r.score),
-    vectorSim: r.vectorSim === null ? null : round3(r.vectorSim),
-    lineRanges: r.lineRanges,
-  }));
+function serializeHits(
+  results: SearchHit[],
+  scoped: boolean,
+  repos: Map<string, Pick<RepoRecord, "source" | "lastIndexedSha">>,
+) {
+  return results.map((r) => {
+    const repo = repos.get(r.repoId);
+    return {
+      ...(scoped ? {} : { repoId: r.repoId }),
+      path: r.path,
+      kind: r.kind,
+      title: r.title,
+      description: r.description,
+      snippet: r.snippet,
+      score: round3(r.score),
+      vectorSim: r.vectorSim === null ? null : round3(r.vectorSim),
+      url:
+        r.kind === "source" && repo
+          ? webSourceUrl(repo.source, repo.lastIndexedSha, r.path, r.lineRanges[0] ?? null)
+          : null,
+      lineRanges: r.lineRanges,
+    };
+  });
 }
 
 export function registerTools(server: McpServer, deps: ToolDeps): void {
@@ -154,6 +173,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       if (query.trim() === "") return err("query is required");
       try {
         const scoped = args.repoId !== undefined;
+        const registry = await deps.getRegistry();
         const res = await hybridSearch(deps.cfg, deps.db, {
           repoId: args.repoId,
           query,
@@ -161,11 +181,11 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
           limit: args.limit ?? 10,
           style: "code",
           checkouts: await deps.getCheckouts(),
-          repoExcludes: await repoExcludesFor(deps),
+          repoExcludes: repoExcludesFor(deps.cfg, registry),
         });
         const payload = {
           ...(scoped ? { repoId: args.repoId } : {}),
-          results: serializeHits(res.results, scoped),
+          results: serializeHits(res.results, scoped, repoWebOf(registry)),
           warnings: res.warnings,
         };
         return ok(encode(payload));
@@ -266,6 +286,8 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       if (question.trim() === "") return err("question is required");
       const scoped = args.repoId !== undefined;
       try {
+        const registry = await deps.getRegistry();
+        const repos = repoWebOf(registry);
         const res = await hybridSearch(deps.cfg, deps.db, {
           repoId: args.repoId,
           query: question,
@@ -273,7 +295,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
           limit: args.limit ?? 5,
           style: "ask",
           checkouts: await deps.getCheckouts(),
-          repoExcludes: await repoExcludesFor(deps),
+          repoExcludes: repoExcludesFor(deps.cfg, registry),
         });
         if (res.results.length === 0) {
           const scope = args.repoId ? `repo ${args.repoId}` : "the indexed repositories";
@@ -293,7 +315,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         if (belowThreshold) {
           const scope = args.repoId ? `repo ${args.repoId}` : "the indexed repositories";
           return ok(
-            `No relevant content found in ${scope} (best similarity ${Math.max(...sims).toFixed(3)} is below the ${deps.cfg.vectorMinSimilarity} threshold) — these are the closest matches, use with caution:\n\n${encode(serializeHits(res.results.slice(0, 3), scoped))}`,
+            `No relevant content found in ${scope} (best similarity ${Math.max(...sims).toFixed(3)} is below the ${deps.cfg.vectorMinSimilarity} threshold) — these are the closest matches, use with caution:\n\n${encode(serializeHits(res.results.slice(0, 3), scoped, repos))}`,
           );
         }
         // One-hop neighbor context for the top wiki result (navigational aid).
@@ -310,7 +332,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         const payload = {
           question,
           ...(scoped ? { repoId: args.repoId } : {}),
-          results: serializeHits(res.results, scoped),
+          results: serializeHits(res.results, scoped, repos),
           warnings: res.warnings,
           ...(neighbors.length > 0 ? { neighbors: { around: top?.path, neighbors } } : {}),
         };
