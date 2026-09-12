@@ -1,6 +1,6 @@
 import MarkdownItCtor from "markdown-it";
 import type { Env, MarkdownIt } from "markdown-it";
-import { createHighlighter, type Highlighter } from "shiki";
+import { createHighlighter, type Highlighter, type ThemeRegistration } from "shiki";
 import { joinBundlePath, resolveLink } from "../index/ingest.ts";
 
 /**
@@ -9,7 +9,51 @@ import { joinBundlePath, resolveLink } from "../index/ingest.ts";
  * grammar/theme loading is real cost, not something to repeat per request.
  */
 
-const SHIKI_THEMES = { light: "github-light", dark: "github-dark" } as const;
+/** Dark syntax palette derived from Mariana's `.sublime-color-scheme`
+ *  variables, covering the scopes the loaded languages emit (spec:
+ *  wiki-viewer › Theme-aware rendering). */
+const MARIANA_THEME = {
+  name: "mariana",
+  type: "dark",
+  colors: {
+    "editor.background": "#363e47",
+    "editor.foreground": "#d8dee9",
+  },
+  tokenColors: [
+    { scope: ["comment", "punctuation.definition.comment"], settings: { foreground: "#a6acb9" } },
+    { scope: ["string", "constant.other.symbol"], settings: { foreground: "#99c794" } },
+    { scope: ["constant.numeric"], settings: { foreground: "#f9ae58" } },
+    {
+      scope: ["constant.language", "constant.character", "constant.other"],
+      settings: { foreground: "#c695c6" },
+    },
+    { scope: ["keyword", "storage"], settings: { foreground: "#ec5f66" } },
+    { scope: ["storage.type"], settings: { foreground: "#c695c6", fontStyle: "italic" } },
+    { scope: ["keyword.operator"], settings: { foreground: "#f97b58" } },
+    {
+      scope: ["entity.name.function", "support.function", "variable.function"],
+      settings: { foreground: "#5fb3b3" },
+    },
+    {
+      scope: ["entity.name.type", "entity.name.class", "support.type", "support.class"],
+      settings: { foreground: "#6699cc", fontStyle: "italic" },
+    },
+    { scope: ["entity.name.tag"], settings: { foreground: "#ec5f66" } },
+    { scope: ["entity.other.attribute-name"], settings: { foreground: "#c695c6" } },
+    { scope: ["variable.parameter"], settings: { foreground: "#f9ae58" } },
+    { scope: ["punctuation", "meta.brace"], settings: { foreground: "#a6acb9" } },
+    {
+      scope: ["markup.heading", "entity.name.section"],
+      settings: { foreground: "#5fb3b3", fontStyle: "bold" },
+    },
+    { scope: ["markup.bold"], settings: { fontStyle: "bold" } },
+    { scope: ["markup.italic"], settings: { fontStyle: "italic" } },
+    { scope: ["markup.raw", "markup.inline.raw"], settings: { foreground: "#99c794" } },
+    { scope: ["invalid"], settings: { foreground: "#f8f8f2" } },
+  ],
+} satisfies ThemeRegistration;
+
+const SHIKI_THEMES = { light: "github-light", dark: MARIANA_THEME.name } as const;
 
 const SHIKI_LANGS = [
   "typescript",
@@ -38,7 +82,7 @@ const SHIKI_LANGS = [
 let highlighterPromise: Promise<Highlighter> | null = null;
 function getHighlighter(): Promise<Highlighter> {
   highlighterPromise ??= createHighlighter({
-    themes: [SHIKI_THEMES.light, SHIKI_THEMES.dark],
+    themes: [SHIKI_THEMES.light, MARIANA_THEME],
     langs: [...SHIKI_LANGS, "text"],
   });
   return highlighterPromise;

@@ -264,7 +264,9 @@ page body's h1–h3 headings in document order as links to those headings'
 in-page anchors, indented by heading level. Every h1–h3 heading in the rendered
 content SHALL carry a stable `id` matching its outline link, and headings whose
 text repeats SHALL receive distinct ids. A page whose body contains no h1–h3
-heading SHALL NOT render the outline.
+heading SHALL NOT render the outline. When scripts run, the outline SHALL mark
+the heading currently in view as the current entry as the page scrolls; without
+scripting the outline SHALL render unchanged.
 
 #### Scenario: Outline links to anchored headings
 - **WHEN** a page body contains a heading
@@ -281,6 +283,10 @@ heading SHALL NOT render the outline.
 #### Scenario: Page without headings
 - **WHEN** a page body contains no h1–h3 heading
 - **THEN** the rendered page contains no outline
+
+#### Scenario: Section in view marked
+- **WHEN** a page with an outline is scrolled so a heading reaches the top of the reading area
+- **THEN** the outline entry for that heading is marked current, and the mark moves as other headings take its place
 
 ### Requirement: Responsive wiki layout
 The wiki layout SHALL place the navigation sidebar and the outline beside the
@@ -301,3 +307,101 @@ topbar SHALL remain visible at every viewport width.
 - **WHEN** a wiki page without a Mermaid diagram is rendered
 - **THEN** the page contains no script that toggles the sidebar or outline
 
+
+### Requirement: Wiki theme preference
+Every wiki page SHALL render with a theme resolved server-side from a
+long-lived `odw_wiki_theme` cookie whose value is `light`, `dark`, or
+`system`; an absent or unrecognized value SHALL resolve to `system`. The
+resolved theme SHALL be applied as a `data-theme` attribute on the document
+element so the first paint already uses it, with `system` following the
+browser's `prefers-color-scheme`. Every wiki page SHALL offer the three
+choices as links — Light, Dark, Auto — marking the active one
+`aria-current="true"` and no other. Selecting a choice (`?theme=<value>`) SHALL
+set the cookie scoped to `/wiki` and redirect to the same path without the
+query, all without client-side script; a request carrying an unrecognized
+theme value SHALL redirect without setting a theme cookie.
+
+#### Scenario: Absent cookie follows the system
+- **WHEN** a wiki page is requested with no theme cookie
+- **THEN** the response renders `data-theme="system"` and the stylesheet's system rules follow `prefers-color-scheme`
+
+#### Scenario: Theme choice sets a cookie and renders
+- **WHEN** `/wiki/<path>?theme=dark` is requested
+- **THEN** the response sets the `odw_wiki_theme=dark` cookie scoped to `/wiki` and redirects to `/wiki/<path>` without the query, and subsequent requests render `data-theme="dark"`
+
+#### Scenario: Stored choice is applied
+- **WHEN** a wiki page is requested with cookie `odw_wiki_theme=light`
+- **THEN** the response renders `data-theme="light"`
+
+#### Scenario: Unrecognized value ignored
+- **WHEN** `/wiki/<path>?theme=blue` is requested
+- **THEN** the response redirects without setting a theme cookie
+
+#### Scenario: Active choice marked
+- **WHEN** a wiki page is rendered
+- **THEN** the toggle link matching the resolved theme carries `aria-current="true"` and the other two do not
+
+#### Scenario: Token and theme bootstrap together
+- **WHEN** a LAN-bound server receives `/wiki/<path>?token=<valid>&theme=dark`
+- **THEN** the response sets both the session and theme cookies and redirects once
+
+#### Scenario: Theme applied without a script
+- **WHEN** a wiki page is rendered
+- **THEN** the theme is present on the server-rendered document and no script reads or writes the theme cookie
+
+### Requirement: Theme-aware rendering
+Rendered code blocks SHALL use the syntax palette of the active theme: the
+light palette under `light`, the Mariana-derived palette under `dark`, and the
+`system` theme follows `prefers-color-scheme`. Mermaid diagrams SHALL
+initialize with diagram theme variables matching the effective theme. Both
+SHALL use only the existing diagram bootstrap — no additional client-side
+script.
+
+#### Scenario: Dark code palette
+- **WHEN** a page renders a code block under `data-theme="dark"`
+- **THEN** the rendered block carries the dark syntax palette and the stylesheet selects it
+
+#### Scenario: Light code palette
+- **WHEN** a page renders a code block under `data-theme="light"`
+- **THEN** the rendered block carries the light syntax palette and the stylesheet selects it
+
+#### Scenario: System follows the preference
+- **WHEN** a page renders under `data-theme="system"`
+- **THEN** code block colors follow `prefers-color-scheme`
+
+#### Scenario: Diagrams match the effective theme
+- **WHEN** a page containing a Mermaid diagram is rendered under a dark theme
+- **THEN** the diagram bootstrap initializes Mermaid with the dark theme variables
+
+### Requirement: Interactive diagrams
+Every rendered Mermaid diagram SHALL be static until expanded. Clicking the
+diagram, pressing Enter or Space while it is focused, or activating its Expand
+control SHALL open a centered popup sized to 90% of the viewport with a margin,
+containing the diagram with pointer-drag panning, wheel zooming centered on
+the pointer, Zoom in and Zoom out controls, and a Close control. The popup
+SHALL be dismissed by its Close control, Escape, or a click outside, and SHALL
+remove itself. Pan and zoom SHALL adjust the SVG's `viewBox` and SHALL be
+bounded so zoom cannot leave the configured range. Panning and zooming SHALL
+exist only in the popup: the inline diagram's `viewBox` SHALL never change. The
+interaction SHALL come from the existing diagram bootstrap; pages without
+diagrams SHALL remain free of any script.
+
+#### Scenario: Diagram expands on click
+- **WHEN** a rendered diagram is clicked, or Enter/Space is pressed while it is focused, or its Expand control is activated
+- **THEN** a centered popup opens showing the diagram with its zoom and pan controls
+
+#### Scenario: Popup zoom and pan
+- **WHEN** the popup is open and the pointer drags, the wheel scrolls, or a zoom control is activated
+- **THEN** the diagram's `viewBox` changes accordingly, bounded so zoom cannot leave the configured range
+
+#### Scenario: Popup dismissed
+- **WHEN** the Close control is activated, Escape is pressed, or the backdrop is clicked
+- **THEN** the popup closes and is removed
+
+#### Scenario: Inline diagrams stay static
+- **WHEN** the pointer drags or the wheel scrolls over an inline diagram
+- **THEN** its `viewBox` does not change
+
+#### Scenario: No diagrams, no viewer
+- **WHEN** a page without a Mermaid diagram is rendered
+- **THEN** neither the diagram bootstrap nor any viewer code is present

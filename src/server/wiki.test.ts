@@ -10,6 +10,7 @@ import {
   hasValidSession,
   parseCookies,
   parseIndexOrder,
+  parseTheme,
   renderRepoListBody,
   renderSidebar,
   resolveWikiPath,
@@ -111,6 +112,20 @@ describe("parseCookies / hasValidSession", () => {
   });
 });
 
+describe("parseTheme", () => {
+  test("recognized values pass through", () => {
+    expect(parseTheme("light")).toBe("light");
+    expect(parseTheme("dark")).toBe("dark");
+    expect(parseTheme("system")).toBe("system");
+  });
+
+  test("absent or unrecognized resolves to system", () => {
+    expect(parseTheme(undefined)).toBe("system");
+    expect(parseTheme(null)).toBe("system");
+    expect(parseTheme("blue")).toBe("system");
+  });
+});
+
 describe("renderRepoListBody", () => {
   test("Repos listed with links", () => {
     const html = renderRepoListBody([{ repoId: "gitlab.com/team/repo" }]);
@@ -182,6 +197,20 @@ describe("buildNavTree", () => {
   test("missing index.md falls back to path order", () => {
     const tree = buildNavTree(NAV_CONCEPTS, new Map());
     expect(tree.map((n) => n.path)).toEqual(["architecture", "overview", "token-validation"]);
+  });
+
+  test("Derived labels are Title Cased", () => {
+    const concepts = [
+      { path: "api-reference", title: "" },
+      { path: "guides/getting-started", title: "" },
+    ];
+    const orders = new Map([["", [{ label: "guides", target: "guides/" }]]]);
+    const tree = buildNavTree(concepts, orders);
+    expect(tree.map((n) => n.label)).toEqual(["Guides", "Api Reference"]);
+    const guides = tree[0];
+    expect(guides?.kind === "dir" ? guides.children.map((n) => n.label) : []).toEqual([
+      "Getting Started",
+    ]);
   });
 
   test("only direct children are ordered by their own directory's index", () => {
@@ -650,6 +679,8 @@ describe("Wiki navigation sidebar", () => {
     expect(architecture).toBeGreaterThanOrEqual(0);
     expect(architecture).toBeLessThan(concepts);
     expect(sidebar.indexOf(`/wiki/${REPO_ID}/concepts/two-modes`)).toBeGreaterThan(concepts);
+    expect(sidebar).toContain(">Architecture</a>");
+    expect(sidebar).toContain(">Concepts</a>");
   });
 
   test("Unlisted concept still listed", async () => {
@@ -721,6 +752,14 @@ describe("On this page outline", () => {
     });
     const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/no-headings`)).text();
     expect(body).not.toContain('class="outline"');
+    expect(body).not.toContain("<script");
+  });
+
+  test("Section in view marked", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/concepts/two-modes`)).text();
+    expect(body).toContain('setAttribute("aria-current", "location")');
+    expect(body).toContain(".outline a[aria-current]");
   });
 });
 
@@ -743,9 +782,177 @@ describe("Responsive wiki layout", () => {
   });
 
   test("No client script for the rails", async () => {
+    const { served } = await serveWiki({
+      files: {
+        "openwiki/plain-page.md": "---\ntype: concept\ntitle: Plain Page\n---\n\nJust text.\n",
+      },
+    });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/plain-page`)).text();
+    expect(sidebarOf(body)).toContain('class="sidebar"');
+    expect(body).not.toContain("<script");
+  });
+});
+
+describe("Wiki theme preference", () => {
+  test("Absent cookie follows the system", async () => {
     const { served } = await serveWiki();
     const body = await (await fetch(`${served.url}/wiki/${REPO_ID}`)).text();
-    expect(body).not.toContain("<script");
+    expect(body).toContain('<html lang="en" data-theme="system">');
+    expect(body).toContain("@media (prefers-color-scheme: dark)");
+    expect(body).toContain('[data-theme="system"]');
+  });
+
+  test("Theme choice sets a cookie and renders", async () => {
+    const { served } = await serveWiki();
+    const res = await fetch(`${served.url}/wiki/${REPO_ID}?theme=dark`, { redirect: "manual" });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(`/wiki/${REPO_ID}`);
+    const cookie = res.headers.get("set-cookie");
+    expect(cookie).toContain("odw_wiki_theme=dark");
+    expect(cookie).toContain("Path=/wiki");
+    expect(cookie).toContain("HttpOnly");
+    const body = await (
+      await fetch(`${served.url}/wiki/${REPO_ID}`, {
+        headers: { cookie: "odw_wiki_theme=dark" },
+      })
+    ).text();
+    expect(body).toContain('data-theme="dark"');
+    expect(body).toContain("#303841");
+  });
+
+  test("Stored choice is applied", async () => {
+    const { served } = await serveWiki();
+    const body = await (
+      await fetch(`${served.url}/wiki/${REPO_ID}`, { headers: { cookie: "odw_wiki_theme=light" } })
+    ).text();
+    expect(body).toContain('data-theme="light"');
+    expect(body).toContain("#f8f7f6");
+    expect(body).toContain("--link: var(--fg)");
+    expect(body).not.toContain("#2f6ad4");
+    expect(body).not.toContain("#85b2e0");
+  });
+
+  test("Unrecognized value ignored", async () => {
+    const { served } = await serveWiki();
+    const res = await fetch(`${served.url}/wiki/${REPO_ID}?theme=blue`, { redirect: "manual" });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("set-cookie")).toBeNull();
+  });
+
+  test("Active choice marked", async () => {
+    const { served } = await serveWiki();
+    const body = await (
+      await fetch(`${served.url}/wiki/${REPO_ID}`, { headers: { cookie: "odw_wiki_theme=dark" } })
+    ).text();
+    expect(body).toContain('aria-current="true" href="?theme=dark"');
+    expect(body).toContain('href="?theme=light"');
+    expect(body).toContain('href="?theme=system"');
+    expect(body.match(/<a aria-current="true"/g)?.length).toBe(1);
+  });
+
+  test("Token and theme bootstrap together", async () => {
+    const { served } = await serveWiki({ bindHost: "0.0.0.0", token: "secret" });
+    const res = await fetch(`${served.url}/wiki/${REPO_ID}?token=secret&theme=dark`, {
+      redirect: "manual",
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(`/wiki/${REPO_ID}`);
+    const cookies = res.headers.getSetCookie();
+    expect(cookies.some((c) => c.includes("odw_wiki_token=secret"))).toBe(true);
+    expect(cookies.some((c) => c.includes("odw_wiki_theme=dark"))).toBe(true);
+  });
+
+  test("Theme applied without a script", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}`)).text();
+    expect(body).toContain('<html lang="en" data-theme="system">');
+    expect(body).not.toContain("odw_wiki_theme");
+  });
+});
+
+describe("Theme-aware rendering", () => {
+  test("Dark code palette", async () => {
+    const { served } = await serveWiki();
+    const body = await (
+      await fetch(`${served.url}/wiki/${REPO_ID}/concepts/two-modes`, {
+        headers: { cookie: "odw_wiki_theme=dark" },
+      })
+    ).text();
+    expect(body).toContain("--shiki-dark:#");
+    expect(body).toContain('[data-theme="dark"] .content pre.shiki');
+  });
+
+  test("Light code palette", async () => {
+    const { served } = await serveWiki();
+    const body = await (
+      await fetch(`${served.url}/wiki/${REPO_ID}/concepts/two-modes`, {
+        headers: { cookie: "odw_wiki_theme=light" },
+      })
+    ).text();
+    expect(body).toContain("--shiki-light:#");
+    expect(body).toContain(
+      ".content pre.shiki, .content pre.shiki span { color: var(--shiki-light); }",
+    );
+  });
+
+  test("System follows the preference", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/concepts/two-modes`)).text();
+    expect(body).toContain('data-theme="system"');
+    expect(body).toContain('[data-theme="system"] .content pre.shiki');
+  });
+
+  test("Diagrams match the effective theme", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/concepts/two-modes`)).text();
+    expect(body).toContain('theme === "dark"');
+    expect(body).toContain('primaryColor: "#414850"');
+  });
+});
+
+describe("Interactive diagrams", () => {
+  test("Diagram expands on click", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/concepts/two-modes`)).text();
+    expect(body).toContain('setAttribute("role", "button")');
+    expect(body).toContain('"Expand diagram"');
+    expect(body).toContain("diagram-modal");
+  });
+
+  test("Popup zoom and pan", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/concepts/two-modes`)).text();
+    expect(body).toContain('"pointerdown"');
+    expect(body).toContain('"wheel"');
+    expect(body).toContain("viewBox");
+    expect(body).toContain("WHEEL_STEP = 1.06");
+    expect(body).toContain("MIN_ZOOM = 0.2");
+    expect(body).toContain("MAX_ZOOM = 5");
+    expect(body).toContain("event.clientX - rect.left");
+  });
+
+  test("Popup dismissed", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/concepts/two-modes`)).text();
+    expect(body).toContain("showModal");
+    expect(body).toContain('"Close"');
+    expect(body).toContain("event.target === dialog");
+    expect(body).toContain("dialog.remove()");
+  });
+
+  test("Inline diagrams stay static", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/concepts/two-modes`)).text();
+    const inlineLoop = body.slice(body.indexOf('document.querySelectorAll("pre.mermaid")'));
+    expect(inlineLoop).not.toContain("setupViewer");
+    expect(inlineLoop).not.toContain('"wheel"');
+  });
+
+  test("No diagrams, no viewer", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}`)).text();
+    expect(body).not.toContain("MIN_ZOOM");
+    expect(body).not.toContain("mermaid.esm.min.mjs");
   });
 });
 

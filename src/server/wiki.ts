@@ -40,6 +40,10 @@ export type WikiDeps = {
 };
 
 const COOKIE_NAME = "odw_wiki_token";
+const THEME_COOKIE = "odw_wiki_theme";
+const THEMES = ["light", "dark", "system"] as const;
+export type WikiTheme = (typeof THEMES)[number];
+const THEME_MAX_AGE = 31536000; // one year
 const MERMAID_ASSET_PREFIX = "/wiki/assets/mermaid/";
 const MERMAID_ENTRY_PATH = `${MERMAID_ASSET_PREFIX}mermaid.esm.min.mjs`;
 
@@ -61,6 +65,20 @@ export function parseCookies(header: string | undefined): Record<string, string>
 export function hasValidSession(req: IncomingMessage, cfg: Config): boolean {
   if (!cfg.bearerToken) return false;
   return parseCookies(req.headers.cookie)[COOKIE_NAME] === cfg.bearerToken;
+}
+
+/** Cookie or query value to a recognized theme; anything else is `system`
+ *  (spec: wiki-viewer › Wiki theme preference). */
+export function parseTheme(value: string | null | undefined): WikiTheme {
+  return value === "light" || value === "dark" || value === "system" ? value : "system";
+}
+
+export function themeFromRequest(req: IncomingMessage): WikiTheme {
+  return parseTheme(parseCookies(req.headers.cookie)[THEME_COOKIE]);
+}
+
+function themeCookie(theme: WikiTheme): string {
+  return `${THEME_COOKIE}=${theme}; Path=/wiki; HttpOnly; SameSite=Lax; Max-Age=${THEME_MAX_AGE}`;
 }
 
 /** Longest-registry-prefix split of a `/wiki/...` pathname into repoId + page
@@ -140,6 +158,15 @@ function baseName(path: string): string {
   return path.split("/").at(-1) ?? path;
 }
 
+/** Derived labels (directory names, title-less concepts) present Title Case so
+ *  they sit beside the authored titles around them (spec: wiki-viewer › Wiki
+ *  navigation sidebar). Authored titles are never rewritten. */
+function titleCase(label: string): string {
+  return label
+    .replace(/[-_]+/g, " ")
+    .replace(/(^|\s)([a-z])/g, (_m, before: string, ch: string) => before + ch.toUpperCase());
+}
+
 /** Nests indexed concepts by directory and orders each directory's entries as
  *  its `index.md` listed them, with anything unlisted appended in path order
  *  (spec: wiki-viewer › Wiki navigation sidebar). A directory node exists when
@@ -175,7 +202,11 @@ export function buildNavTree(
       if (page !== null && parentDir(page) === dir) {
         if (listedPages.has(page)) continue;
         listedPages.add(page);
-        nodes.push({ kind: "page", path: page, label: titles.get(page) ?? baseName(page) });
+        nodes.push({
+          kind: "page",
+          path: page,
+          label: titles.get(page) ?? titleCase(baseName(page)),
+        });
         continue;
       }
       if (!(entry.target.split("#")[0] ?? "").endsWith("/")) continue;
@@ -186,7 +217,7 @@ export function buildNavTree(
       nodes.push({
         kind: "dir",
         path: child,
-        label: entry.label || baseName(child),
+        label: titleCase(entry.label || baseName(child)),
         children: build(child),
       });
     }
@@ -194,7 +225,12 @@ export function buildNavTree(
     const rest: NavNode[] = [];
     for (const child of childDirs(dir)) {
       if (!listedDirs.has(child)) {
-        rest.push({ kind: "dir", path: child, label: baseName(child), children: build(child) });
+        rest.push({
+          kind: "dir",
+          path: child,
+          label: titleCase(baseName(child)),
+          children: build(child),
+        });
       }
     }
     for (const concept of concepts) {
@@ -202,7 +238,7 @@ export function buildNavTree(
         rest.push({
           kind: "page",
           path: concept.path,
-          label: concept.title || baseName(concept.path),
+          label: concept.title || titleCase(baseName(concept.path)),
         });
       }
     }
@@ -315,7 +351,9 @@ export function renderShell(opts: {
   includeMermaid: boolean;
   sidebarHtml?: string;
   outline?: OutlineEntry[];
+  theme?: WikiTheme;
 }): string {
+  const theme = opts.theme ?? "system";
   const crumbHtml = opts.breadcrumb
     .map((c) =>
       c.href
@@ -326,7 +364,7 @@ export function renderShell(opts: {
   const outlineHtml = renderOutline(opts.outline ?? []);
   const layoutClass = opts.sidebarHtml === undefined ? "layout layout--plain" : "layout";
   return `<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="${theme}">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -334,15 +372,27 @@ export function renderShell(opts: {
 <style>${WIKI_CSS}</style>
 </head>
 <body>
-<header class="topbar"><nav class="breadcrumb">${crumbHtml}</nav></header>
+<header class="topbar"><nav class="breadcrumb">${crumbHtml}</nav>${renderThemeSwitch(theme)}</header>
 <div class="${layoutClass}">
 ${opts.sidebarHtml ?? ""}
 <main class="content">${opts.contentHtml}</main>
 ${outlineHtml}
 </div>
 ${opts.includeMermaid ? MERMAID_BOOTSTRAP : ""}
+${outlineHtml === "" ? "" : OUTLINE_SPY}
 </body>
 </html>`;
+}
+
+/** Zero-JS toggle: each link sets the theme cookie via `?theme=` and the
+ *  server redirects back (spec: wiki-viewer › Wiki theme preference). */
+function renderThemeSwitch(theme: WikiTheme): string {
+  const labels: Record<WikiTheme, string> = { light: "Light", dark: "Dark", system: "Auto" };
+  const links = THEMES.map((value) => {
+    const current = value === theme ? ' aria-current="true"' : "";
+    return `<a${current} href="?theme=${value}">${labels[value]}</a>`;
+  }).join("");
+  return `<nav class="theme-switch" aria-label="Theme">${links}</nav>`;
 }
 
 /** "On this page" rail, indented 12px per level below the shallowest heading
@@ -351,42 +401,63 @@ function renderOutline(entries: OutlineEntry[]): string {
   if (entries.length === 0) return "";
   const base = Math.min(...entries.map((e) => e.level));
   const items = entries
-    .map(
-      (e) =>
-        `<li style="padding-left:${(e.level - base) * 12}px"><a href="#${escapeAttr(e.id)}">${escapeHtml(e.text)}</a></li>`,
-    )
+    .map((e) => {
+      return `<li style="padding-left:${(e.level - base) * 12}px"><a href="#${escapeAttr(e.id)}">${escapeHtml(e.text)}</a></li>`;
+    })
     .join("");
   return `<aside class="outline" aria-label="On this page"><h2>On this page</h2><ul>${items}</ul></aside>`;
 }
 
 const WIKI_CSS = `
 :root {
-  --bg: #ffffff; --fg: #1c1e21; --muted: #6b7280; --border: #e5e7eb;
-  --link: #0b5fff; --code-bg: #f6f8fa; --shiki-light-bg: #f6f8fa; --shiki-dark-bg: #0d1117;
-  --topbar-h: 3.25rem; --rail-w: 16rem; --toc-w: 14rem;
+  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  --bg: #f8f7f6; --hover: #e8e8e8; --border: #e0e0e0;
+  --fg: #333333; --muted: #666666; --link: var(--fg);
+  --code-bg: #f1f1f1; --inline-code-bg: rgba(0, 0, 0, 0.05);
+  --selection: color-mix(in oklab, var(--link) 22%, transparent);
+  color-scheme: light;
+
+  --topbar-h: 3.25rem; --rail-w: 16rem; --toc-w: 16rem;
+}
+[data-theme="dark"] {
+  --bg: #303841; --hover: #414850; --border: #495058;
+  --fg: #d8dee9; --muted: #a6acb9;
+  --code-bg: #363e47; --inline-code-bg: #3e4852; --selection: #4d5864;
+  color-scheme: dark;
 }
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --border: #30363d;
-    --link: #6ea8fe; --code-bg: #161b22;
+  [data-theme="system"] {
+    --bg: #303841; --hover: #414850; --border: #495058;
+    --fg: #d8dee9; --muted: #a6acb9;
+    --code-bg: #363e47; --inline-code-bg: #3e4852; --selection: #4d5864;
+    color-scheme: dark;
   }
 }
+::selection { background: var(--selection); }
 * { box-sizing: border-box; }
 body {
   margin: 0; background: var(--bg); color: var(--fg);
-  font-family: ui-sans-serif, -apple-system, "Segoe UI", system-ui, Roboto, sans-serif;
-  font-size: 16px; line-height: 1.5;
+  font-family: var(--font-sans); font-size: 16px; line-height: 1.75;
 }
 .topbar {
   position: sticky; top: 0; z-index: 1; height: var(--topbar-h);
-  display: flex; align-items: center; overflow-x: auto; white-space: nowrap;
+  display: flex; align-items: center;
   background: var(--bg); border-bottom: 1px solid var(--border);
-  padding: 0 1.5rem; font-size: 0.9rem;
+  padding: 0 1.5rem; font-size: 0.875rem;
 }
+.breadcrumb { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .breadcrumb a { color: var(--muted); text-decoration: none; }
 .breadcrumb a:hover { color: var(--link); text-decoration: underline; }
 .breadcrumb .sep { color: var(--border); padding: 0 0.15rem; }
 .breadcrumb [aria-current] { color: var(--fg); font-weight: 600; }
+.theme-switch { margin-left: auto; padding-left: 1rem; flex-shrink: 0; display: flex; gap: 0.25rem; }
+.theme-switch a {
+  color: var(--muted); text-decoration: none; padding: 0.15rem 0.5rem; border-radius: 999px;
+}
+.theme-switch a:hover { color: var(--fg); background: var(--hover); }
+.theme-switch a[aria-current="true"] { color: var(--fg); background: var(--hover); font-weight: 600; }
 .layout {
   display: grid; grid-template-columns: var(--rail-w) minmax(0, 1fr) var(--toc-w);
   gap: 2rem; align-items: start; max-width: 96rem; margin: 0 auto; padding: 0 1.5rem;
@@ -396,7 +467,7 @@ body {
   position: sticky; top: var(--topbar-h); padding: 2rem 0 5rem;
   max-height: calc(100vh - var(--topbar-h)); overflow-y: auto;
 }
-.sidebar { border-right: 1px dashed var(--border); padding-right: 1rem; }
+.sidebar { border-right: 1px dashed var(--border); padding-right: 1rem; font-size: 0.875rem; }
 .sidebar ul { list-style: none; margin: 0; padding: 0; }
 .sidebar ul ul { margin-left: 0.75rem; }
 .sidebar li { margin: 0.1rem 0; }
@@ -404,40 +475,79 @@ body {
   display: block; padding: 0.3rem 0.5rem; border-radius: 4px;
   color: var(--muted); text-decoration: none;
 }
-.sidebar a:hover { background: var(--code-bg); color: var(--fg); }
-.sidebar a[aria-current="page"] { background: var(--code-bg); color: var(--fg); font-weight: 600; }
+.sidebar a:hover { background: var(--hover); color: var(--fg); }
+.sidebar a[aria-current="page"] { background: var(--hover); color: var(--fg); font-weight: 600; }
 .sidebar .indexed {
   margin: 0 0 0.75rem; padding: 0 0.5rem; color: var(--muted); font-size: 0.75rem;
 }
 .sidebar .indexed a { display: inline; padding: 0; text-decoration: underline; }
-.outline { font-size: 0.8125rem; }
+.outline { font-size: 0.875rem; }
 .outline h2 {
-  margin: 0 0 0.5rem; font-size: 0.75rem; text-transform: uppercase;
-  letter-spacing: 0.05em; color: var(--muted);
+  margin: 0 0 1.25rem; padding: 0 1rem; font-size: 1.125rem; font-weight: 500;
+  line-height: 1; color: var(--fg);
 }
-.outline ul { list-style: none; margin: 0; padding: 0; }
+.outline ul { list-style: none; margin: 0; padding: 0 1rem; }
+.outline li + li { margin-top: 0.75rem; }
 .outline a { color: var(--muted); text-decoration: none; }
-.outline a:hover { color: var(--link); }
+.outline a:hover { color: var(--fg); }
+.outline a[aria-current] { color: var(--fg); font-weight: 500; }
 .content { max-width: 42rem; width: 100%; margin: 0 auto; padding: 2.5rem 0 5rem; }
 .layout--plain .content { padding: 2.5rem 1.5rem 5rem; }
-.content h1, .content h2, .content h3 {
-  line-height: 1.3; letter-spacing: -0.01em; scroll-margin-top: calc(var(--topbar-h) + 0.5rem);
+.content h1, .content h2, .content h3 { scroll-margin-top: calc(var(--topbar-h) + 0.5rem); }
+.content h1 { font-size: 1.375rem; font-weight: 700; line-height: 1.875rem; margin: 0 0 0.8em; }
+.content h2 { font-size: 1.25rem; font-weight: 700; line-height: 1.75rem; margin: 1.5em 0 0.8em; }
+.content h3 { font-size: 1.2em; font-weight: 600; line-height: 1.65; margin: 1.5em 0 0.5em; }
+.content p { margin: 1.15em 0; }
+.content li { margin: 0.35em 0; }
+.content a { color: var(--link); font-weight: 500; text-decoration: underline; text-underline-offset: 2px; }
+.content blockquote { margin: 1.5em 0; padding: 0 1em; border-left: 3px solid var(--border); color: var(--muted); }
+.content hr { border: 0; border-top: 1px solid var(--border); margin: 2em 0; }
+.content img { max-width: 100%; }
+.content pre {
+  overflow-x: auto; font-family: var(--font-mono); font-size: 0.85em;
+  line-height: 1.75; border-radius: 6px; padding: 0.857em 1.143em;
 }
-.content a { color: var(--link); }
-.content pre { overflow-x: auto; border-radius: 6px; padding: 1rem; }
 .content pre.shiki, .content pre.shiki span { color: var(--shiki-light); }
-.content pre.shiki { background-color: var(--shiki-light-bg) !important; }
+.content pre.shiki { background-color: var(--code-bg) !important; }
+[data-theme="dark"] .content pre.shiki,
+[data-theme="dark"] .content pre.shiki span { color: var(--shiki-dark); }
 @media (prefers-color-scheme: dark) {
-  .content pre.shiki, .content pre.shiki span {
-    color: var(--shiki-dark) !important; background-color: var(--shiki-dark-bg) !important;
-  }
+  [data-theme="system"] .content pre.shiki,
+  [data-theme="system"] .content pre.shiki span { color: var(--shiki-dark); }
 }
 .content :not(pre) > code {
-  background: var(--code-bg); border-radius: 4px; padding: 0.1em 0.35em;
-  font-size: 0.9em;
+  background: var(--inline-code-bg); border-radius: 4px; padding: 0.15em 0.35em;
+  font-family: var(--font-mono); font-size: 0.85em; font-weight: 600;
 }
-.content pre.mermaid { background: none; text-align: center; }
-.content table { border-collapse: collapse; width: 100%; }
+.content pre.mermaid {
+  position: relative; background: none; text-align: center; padding: 1rem;
+  cursor: pointer; border: 1px solid var(--border); border-radius: 6px;
+  transition: border-color 0.15s;
+}
+.content pre.mermaid:hover, .content pre.mermaid:focus-visible { border-color: var(--muted); }
+.diagram-tools {
+  position: absolute; top: 0.5rem; right: 0.5rem; display: flex; gap: 0.25rem;
+  opacity: 0; transition: opacity 0.15s;
+}
+.content pre.mermaid:hover .diagram-tools,
+.content pre.mermaid:focus-within .diagram-tools,
+.diagram-modal .diagram-tools { opacity: 1; }
+.diagram-tools button {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 1.75rem; height: 1.75rem; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg); color: var(--muted); font-size: 1rem; line-height: 1;
+  cursor: pointer; opacity: 0.7; transition: opacity 0.15s, color 0.15s;
+}
+.diagram-tools button:hover, .diagram-tools button:focus-visible { opacity: 1; color: var(--fg); }
+.diagram-modal {
+  width: 90vw; max-width: 90vw; height: 90vh; max-height: 90vh; margin: auto;
+  border: 1px solid var(--border); border-radius: 8px; padding: 0;
+  background: var(--bg); overflow: hidden;
+}
+.diagram-modal::backdrop { background: rgb(0 0 0 / 0.45); }
+.diagram-modal-stage { position: relative; width: 100%; height: 100%; }
+.diagram-modal-stage svg { width: 100%; height: 100%; max-width: none; }
+.content table { border-collapse: collapse; width: 100%; font-size: 0.875em; line-height: 1.5; }
 .content th, .content td { border: 1px solid var(--border); padding: 0.4rem 0.6rem; text-align: left; }
 .repo-list { list-style: none; padding: 0; }
 .repo-list li { padding: 0.35rem 0; border-bottom: 1px solid var(--border); }
@@ -454,10 +564,156 @@ body {
 }
 `;
 
+const OUTLINE_SPY = `<script type="module">
+  const links = new Map(
+    [...document.querySelectorAll(".outline a")].map((a) => [a.hash.slice(1), a]),
+  );
+  const headings = [...links.keys()].map((id) => document.getElementById(id)).filter(Boolean);
+  const update = () => {
+    const line = document.querySelector(".topbar").getBoundingClientRect().bottom + 8;
+    let active = headings[0];
+    for (const heading of headings) {
+      if (heading.getBoundingClientRect().top <= line) active = heading;
+    }
+    for (const link of links.values()) link.removeAttribute("aria-current");
+    if (active) links.get(active.id)?.setAttribute("aria-current", "location");
+  };
+  addEventListener("scroll", () => requestAnimationFrame(update), { passive: true });
+  update();
+</script>`;
+
 const MERMAID_BOOTSTRAP = `<script type="module">
   import mermaid from "${MERMAID_ENTRY_PATH}";
-  mermaid.initialize({ startOnLoad: false, securityLevel: "strict" });
-  mermaid.run({ querySelector: ".mermaid" });
+  const prefersDark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const theme = document.documentElement.dataset.theme;
+  const dark = theme === "dark" || (theme !== "light" && prefersDark);
+  mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: "strict",
+    theme: "base",
+    themeVariables: dark
+      ? { background: "transparent", primaryColor: "#414850", primaryTextColor: "#d8dee9", primaryBorderColor: "#495058", lineColor: "#a6acb9", secondaryColor: "#384049", tertiaryColor: "#303841" }
+      : { background: "transparent", primaryColor: "#e8e8e8", primaryTextColor: "#333333", primaryBorderColor: "#e0e0e0", lineColor: "#666666", secondaryColor: "#f2f1f0", tertiaryColor: "#f8f7f6" },
+  });
+  await mermaid.run({ querySelector: ".mermaid" });
+  const MIN_ZOOM = 0.2, MAX_ZOOM = 5, ZOOM_STEP = 1.2, WHEEL_STEP = 1.06;
+  const setupViewer = (svg) => {
+    if (!svg || !svg.viewBox.baseVal.width || !svg.viewBox.baseVal.height) return null;
+    const naturalWidth = svg.viewBox.baseVal.width;
+    svg.style.touchAction = "none";
+    svg.style.userSelect = "none";
+    svg.style.cursor = "grab";
+    const apply = (x, y, w, h) => svg.setAttribute("viewBox", x + " " + y + " " + w + " " + h);
+    const zoom = (scale, px, py) => {
+      const box = svg.viewBox.baseVal;
+      const rect = svg.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const w = Math.max(naturalWidth / MAX_ZOOM, Math.min(naturalWidth / MIN_ZOOM, box.width * scale));
+      const h = w * (box.height / box.width);
+      const cx = px ?? rect.width / 2;
+      const cy = py ?? rect.height / 2;
+      apply(box.x + (box.width - w) * (cx / rect.width), box.y + (box.height - h) * (cy / rect.height), w, h);
+    };
+    let drag = null;
+    svg.addEventListener("pointerdown", (event) => {
+      drag = { x: event.clientX, y: event.clientY, bx: svg.viewBox.baseVal.x, by: svg.viewBox.baseVal.y };
+      svg.setPointerCapture(event.pointerId);
+      svg.style.cursor = "grabbing";
+    });
+    svg.addEventListener("pointermove", (event) => {
+      if (!drag) return;
+      const rect = svg.getBoundingClientRect();
+      const box = svg.viewBox.baseVal;
+      apply(
+        drag.bx - ((event.clientX - drag.x) * box.width) / rect.width,
+        drag.by - ((event.clientY - drag.y) * box.height) / rect.height,
+        box.width,
+        box.height,
+      );
+    });
+    const endDrag = () => {
+      drag = null;
+      svg.style.cursor = "grab";
+    };
+    svg.addEventListener("pointerup", endDrag);
+    svg.addEventListener("pointercancel", endDrag);
+    svg.addEventListener(
+      "wheel",
+      (event) => {
+        event.preventDefault();
+        const rect = svg.getBoundingClientRect();
+        const factor = Math.pow(WHEEL_STEP, event.deltaY > 0 ? 1 : -1);
+        zoom(factor, event.clientX - rect.left, event.clientY - rect.top);
+      },
+      { passive: false },
+    );
+    return { zoom };
+  };
+  const toolButton = (act, label, inner) =>
+    '<button type="button" data-act="' + act + '" aria-label="' + label + '">' + inner + "</button>";
+  const ZOOM_IN = toolButton("in", "Zoom in", "+");
+  const ZOOM_OUT = toolButton("out", "Zoom out", "−");
+  const EXPAND_ICON =
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 4H4v5M15 4h5v5M4 15v5h5M20 15v5h-5"/></svg>';
+  const wireTools = (tools, viewer, onClose) => {
+    tools.querySelector('[data-act="in"]').addEventListener("click", () => viewer.zoom(1 / ZOOM_STEP));
+    tools.querySelector('[data-act="out"]').addEventListener("click", () => viewer.zoom(ZOOM_STEP));
+    if (onClose) tools.querySelector('[data-act="close"]').addEventListener("click", onClose);
+  };
+  const expand = (source) => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "diagram-modal";
+    const stage = document.createElement("div");
+    stage.className = "diagram-modal-stage";
+    const clone = source.cloneNode(true);
+    clone.removeAttribute("width");
+    clone.removeAttribute("height");
+    clone.style.width = "100%";
+    clone.style.height = "100%";
+    clone.style.maxWidth = "none";
+    stage.append(clone);
+    const tools = document.createElement("div");
+    tools.className = "diagram-tools";
+    tools.innerHTML = ZOOM_IN + ZOOM_OUT + toolButton("close", "Close", "×");
+    stage.append(tools);
+    dialog.append(stage);
+    document.body.append(dialog);
+    const close = () => dialog.close();
+    dialog.addEventListener("close", () => {
+      document.body.style.overflow = "";
+      dialog.remove();
+    });
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) close();
+    });
+    document.body.style.overflow = "hidden";
+    dialog.showModal();
+    const viewer = setupViewer(clone);
+    if (viewer) wireTools(tools, viewer, close);
+    tools.querySelector('[data-act="close"]').focus();
+  };
+  for (const host of document.querySelectorAll("pre.mermaid")) {
+    if (!host.querySelector("svg")) continue;
+    host.setAttribute("role", "button");
+    host.setAttribute("tabindex", "0");
+    host.setAttribute("aria-label", "Expand diagram");
+    const open = () => expand(host.querySelector("svg"));
+    host.addEventListener("click", open);
+    host.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        open();
+      }
+    });
+    const tools = document.createElement("div");
+    tools.className = "diagram-tools";
+    tools.innerHTML = toolButton("expand", "Expand diagram", EXPAND_ICON);
+    tools.querySelector('[data-act="expand"]').addEventListener("click", (event) => {
+      event.stopPropagation();
+      open();
+    });
+    host.append(tools);
+  }
 </script>`;
 
 // ---- rendering (I/O) ----
@@ -612,25 +868,30 @@ export async function handleWiki(
 
   const parsed = new URL(url, "http://internal");
   const pathname = parsed.pathname;
+  const theme = themeFromRequest(req);
+  const themeParam = parsed.searchParams.get("theme");
+  const requestedTheme = THEMES.find((t) => t === themeParam) ?? null;
 
-  // Bootstrap: `?token=` on any /wiki path sets the session cookie and
-  // redirects to the same path without the query, so deep links
+  // Bootstrap: `?token=` and/or `?theme=` on any /wiki path set their cookie
+  // and redirect to the same path without the query, so deep links
   // (`/wiki/<repoId>?token=…`, e.g. from the dashboard) work in one hop.
   const tokenParam = parsed.searchParams.get("token");
   if (tokenParam !== null) {
     // No session is needed at all on a localhost bind (or when no token is
     // configured) — validating here would 401 a stale/copy-pasted `?token=`
     // even though the bare URL would have worked unauthenticated.
+    const cookies: string[] = [];
     if (deps.requiresToken) {
       if (!deps.cfg.bearerToken || tokenParam !== deps.cfg.bearerToken) {
         sendText(res, 401, "invalid token");
         return true;
       }
-      res.setHeader(
-        "Set-Cookie",
+      cookies.push(
         `${COOKIE_NAME}=${encodeURIComponent(tokenParam)}; Path=/wiki; HttpOnly; SameSite=Lax`,
       );
     }
+    if (requestedTheme !== null) cookies.push(themeCookie(requestedTheme));
+    if (cookies.length > 0) res.setHeader("Set-Cookie", cookies);
     res.writeHead(302, { location: pathname });
     res.end();
     return true;
@@ -638,6 +899,13 @@ export async function handleWiki(
 
   if (deps.requiresToken && !hasValidSession(req, deps.cfg)) {
     sendText(res, 401, "unauthorized — visit /wiki?token=<token> once to start a session");
+    return true;
+  }
+
+  if (themeParam !== null) {
+    if (requestedTheme !== null) res.setHeader("Set-Cookie", themeCookie(requestedTheme));
+    res.writeHead(302, { location: pathname });
+    res.end();
     return true;
   }
 
@@ -662,6 +930,7 @@ export async function handleWiki(
         breadcrumb: [{ label: "wiki", href: null }],
         contentHtml: `<h1>Repositories</h1>${renderRepoListBody(registry.repos)}`,
         includeMermaid: false,
+        theme,
       }),
     );
     return true;
@@ -705,6 +974,7 @@ export async function handleWiki(
       includeMermaid: hasMermaidDiagram(page.html),
       sidebarHtml: await buildSidebar(deps.db, repo, currentPath),
       outline: page.outline,
+      theme,
     }),
   );
   return true;

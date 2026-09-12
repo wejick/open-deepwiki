@@ -46,6 +46,17 @@ describe("Mermaid block rendered as a diagram", () => {
   });
 });
 
+describe("Theme-aware code rendering", () => {
+  test("code blocks carry the Mariana dark palette", async () => {
+    const md = await createWikiMarkdown();
+    const html = md.render("```ts\nconst n = 42; // note\n```\n", env());
+    expect(html).toContain("mariana");
+    expect(html).toContain("--shiki-dark:#F9AE58"); // number
+    expect(html).toContain("--shiki-dark:#A6ACB9"); // punctuation/comment gray
+    expect(html).toContain("--shiki-dark-bg:#363e47");
+  });
+});
+
 describe("Heading anchors and outline", () => {
   test("heading ids emitted and outline collected in document order", async () => {
     const md = await createWikiMarkdown();
