@@ -6,9 +6,12 @@ import type { Client as DbClient } from "@libsql/client";
 import { startServer, type ServeResult } from "./server.ts";
 import {
   buildBreadcrumb,
+  buildNavTree,
   hasValidSession,
   parseCookies,
+  parseIndexOrder,
   renderRepoListBody,
+  renderSidebar,
   resolveWikiPath,
 } from "./wiki.ts";
 import { openDb } from "../index/db.ts";
@@ -116,6 +119,131 @@ describe("renderRepoListBody", () => {
 
   test("No repos registered", () => {
     expect(renderRepoListBody([])).toContain("No repositories registered yet.");
+  });
+});
+
+// ---- sidebar tree ----
+
+const NAV_CONCEPTS = [
+  { path: "overview", title: "Overview" },
+  { path: "token-validation", title: "Token Validation" },
+  { path: "architecture/overview", title: "Architecture Overview" },
+];
+
+const NAV_REPO = {
+  repoId: "gitlab.corp/team/repo",
+  source: "git@gitlab.corp:team/repo.git",
+  lastIndexedSha: "abc1234",
+  lastSuccessAt: "2026-09-12T10:00:00.000Z",
+};
+
+describe("parseIndexOrder", () => {
+  test("links in document order with their labels", () => {
+    const entries = parseIndexOrder(
+      "# Files\n\n- [Overview](overview.md) - intro\n- [Architecture](architecture/)\n",
+    );
+    expect(entries).toEqual([
+      { label: "Overview", target: "overview.md" },
+      { label: "Architecture", target: "architecture/" },
+    ]);
+  });
+});
+
+describe("buildNavTree", () => {
+  test("Tree nested and ordered by index.md", () => {
+    const orders = new Map([
+      [
+        "",
+        [
+          { label: "Token Validation", target: "token-validation.md" },
+          { label: "Architecture", target: "architecture/" },
+        ],
+      ],
+      ["architecture", [{ label: "Overview", target: "overview.md" }]],
+    ]);
+    expect(buildNavTree(NAV_CONCEPTS, orders)).toEqual([
+      { kind: "page", path: "token-validation", label: "Token Validation" },
+      {
+        kind: "dir",
+        path: "architecture",
+        label: "Architecture",
+        children: [{ kind: "page", path: "architecture/overview", label: "Architecture Overview" }],
+      },
+      { kind: "page", path: "overview", label: "Overview" },
+    ]);
+  });
+
+  test("Unlisted concept still listed", () => {
+    const orders = new Map([["", [{ label: "Overview", target: "overview.md" }]]]);
+    const tree = buildNavTree(NAV_CONCEPTS, orders);
+    expect(tree.map((n) => n.path)).toEqual(["overview", "architecture", "token-validation"]);
+  });
+
+  test("missing index.md falls back to path order", () => {
+    const tree = buildNavTree(NAV_CONCEPTS, new Map());
+    expect(tree.map((n) => n.path)).toEqual(["architecture", "overview", "token-validation"]);
+  });
+
+  test("only direct children are ordered by their own directory's index", () => {
+    const concepts = [
+      { path: "guide", title: "Guide" },
+      { path: "guides/a", title: "A" },
+      { path: "guides/sub/x", title: "X" },
+    ];
+    const orders = new Map([
+      [
+        "guides",
+        [
+          { label: "Guide", target: "../guide.md" },
+          { label: "Sub", target: "sub/" },
+        ],
+      ],
+    ]);
+    const tree = buildNavTree(concepts, orders);
+    expect(tree.map((n) => n.path)).toEqual(["guide", "guides"]);
+    const guides = tree[1];
+    expect(guides?.kind === "dir" ? guides.children.map((n) => n.path) : []).toEqual([
+      "guides/sub",
+      "guides/a",
+    ]);
+  });
+});
+
+describe("renderSidebar", () => {
+  const tree = buildNavTree(NAV_CONCEPTS, new Map());
+
+  test("Current concept marked", () => {
+    const html = renderSidebar(tree, "token-validation", NAV_REPO);
+    expect(html).toContain(
+      'aria-current="page" href="/wiki/gitlab.corp/team/repo/token-validation"',
+    );
+    expect(html).not.toContain('aria-current="page" href="/wiki/gitlab.corp/team/repo/overview"');
+  });
+
+  test("Current directory marked", () => {
+    const html = renderSidebar(tree, "architecture", NAV_REPO);
+    expect(html).toContain('aria-current="page" href="/wiki/gitlab.corp/team/repo/architecture"');
+  });
+
+  test("Repo root has no current entry", () => {
+    expect(renderSidebar(tree, "", NAV_REPO)).not.toContain("aria-current");
+  });
+
+  test("Indexed revision linked", () => {
+    const html = renderSidebar(tree, "", NAV_REPO);
+    expect(html).toContain("Last indexed: 2026-09-12");
+    expect(html).toContain('href="https://gitlab.corp/team/repo/-/commit/abc1234">abc1234</a>');
+  });
+
+  test("Revision without a web location stays text", () => {
+    const html = renderSidebar(tree, "", { ...NAV_REPO, source: "/srv/code/repo" });
+    expect(html).toContain("(abc1234)");
+    expect(html).not.toContain("commit");
+  });
+
+  test("Never-indexed repo renders without revision information", () => {
+    const html = renderSidebar(tree, "", { ...NAV_REPO, lastIndexedSha: null });
+    expect(html).not.toContain("Last indexed:");
   });
 });
 
@@ -248,7 +376,7 @@ describe("Repo directory listing", () => {
 });
 
 describe("Wiki page routing", () => {
-  test("Repo root renders the top-level wiki listing", async () => {
+  test("Repo root", async () => {
     const { served } = await serveWiki();
     const res = await fetch(`${served.url}/wiki/${REPO_ID}`);
     expect(res.status).toBe(200);
@@ -257,6 +385,29 @@ describe("Wiki page routing", () => {
     expect(body).toContain(`href="/wiki/${REPO_ID}/architecture"`);
     // root index.md carries okf_version frontmatter — it must be stripped, not rendered as text
     expect(body).not.toContain("okf_version");
+  });
+
+  test("Repo root renders overview", async () => {
+    const { served } = await serveWiki({ bundle: "valid" });
+    const res = await fetch(`${served.url}/wiki/${REPO_ID}`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("Overview of Fixture Repo");
+    expect(body).toContain('class="outline"');
+  });
+
+  test("Root overview marked", async () => {
+    const { served } = await serveWiki({ bundle: "valid" });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}`)).text();
+    expect(sidebarOf(body)).toContain(`aria-current="page" href="/wiki/${REPO_ID}/overview"`);
+  });
+
+  test("Repo root with an overview missing on disk falls back to the listing", async () => {
+    const { served, checkout } = await serveWiki({ bundle: "valid" });
+    await rm(join(checkout!, "openwiki", "overview.md"));
+    const res = await fetch(`${served.url}/wiki/${REPO_ID}`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('<h1 id="files">');
   });
 
   test("Leaf page renders the concept", async () => {
@@ -466,6 +617,135 @@ describe("Breadcrumb navigation", () => {
     expect(body).toContain(`<a href="/wiki/${REPO_ID}">${REPO_ID}</a>`);
     expect(body).toContain(`<a href="/wiki/${REPO_ID}/concepts">concepts</a>`);
     expect(body).toContain('aria-current="page">Code vs Personal Modes<');
+  });
+});
+
+function sidebarOf(body: string): string {
+  const start = body.indexOf('<nav class="sidebar"');
+  const end = body.indexOf("</nav>", start);
+  return start === -1 ? "" : body.slice(start, end);
+}
+
+describe("Wiki navigation sidebar", () => {
+  test("Repo root has a sidebar", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}`)).text();
+    const sidebar = sidebarOf(body);
+    expect(sidebar).toContain(`href="/wiki/${REPO_ID}/architecture"`);
+    expect(sidebar).toContain(`href="/wiki/${REPO_ID}/concepts/two-modes"`);
+  });
+
+  test("Repo directory listing has no sidebar", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki`)).text();
+    expect(body).not.toContain('class="sidebar"');
+  });
+
+  test("Tree nested and ordered by index.md", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}`)).text();
+    const sidebar = sidebarOf(body);
+    const architecture = sidebar.indexOf(`/wiki/${REPO_ID}/architecture"`);
+    const concepts = sidebar.indexOf(`/wiki/${REPO_ID}/concepts"`);
+    expect(architecture).toBeGreaterThanOrEqual(0);
+    expect(architecture).toBeLessThan(concepts);
+    expect(sidebar.indexOf(`/wiki/${REPO_ID}/concepts/two-modes`)).toBeGreaterThan(concepts);
+  });
+
+  test("Unlisted concept still listed", async () => {
+    const { served } = await serveWiki({
+      files: { "openwiki/extra.md": "---\ntype: concept\ntitle: Extra Page\n---\n\nBody.\n" },
+    });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}`)).text();
+    expect(sidebarOf(body)).toContain(`>Extra Page</a>`);
+  });
+
+  test("Current concept marked", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/concepts/two-modes`)).text();
+    expect(sidebarOf(body)).toContain(
+      `aria-current="page" href="/wiki/${REPO_ID}/concepts/two-modes"`,
+    );
+  });
+
+  test("Current directory marked", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/architecture`)).text();
+    expect(sidebarOf(body)).toContain(`aria-current="page" href="/wiki/${REPO_ID}/architecture"`);
+  });
+
+  test("Indexed revision linked", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}`)).text();
+    const today = new Date().toISOString().slice(0, 10);
+    expect(sidebarOf(body)).toContain(`Last indexed: ${today}`);
+    expect(sidebarOf(body)).toContain(
+      'href="https://gitlab.corp/team/repo/-/commit/abc1234">abc1234</a>',
+    );
+  });
+
+  test("Revision without a web location", async () => {
+    const { served } = await serveWiki({ source: "/srv/code/repo" });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}`)).text();
+    expect(sidebarOf(body)).toContain("(abc1234)");
+    expect(sidebarOf(body)).not.toContain("/-/commit/");
+  });
+
+  test("Never-indexed repo renders without revision information", async () => {
+    const { served } = await serveWiki({ lastIndexedSha: null });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}`)).text();
+    expect(sidebarOf(body)).not.toContain("Last indexed:");
+  });
+});
+
+describe("On this page outline", () => {
+  test("Outline links to anchored headings", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/concepts/two-modes`)).text();
+    expect(body).toContain('<h1 id="code-vs-personal-modes">');
+    expect(body).toContain('href="#code-vs-personal-modes"');
+  });
+
+  test("Indented by heading level", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/concepts/two-modes`)).text();
+    expect(body).toContain('style="padding-left:0px"');
+    expect(body).toContain('style="padding-left:12px"');
+  });
+
+  test("Page without headings", async () => {
+    const { served } = await serveWiki({
+      files: {
+        "openwiki/no-headings.md": "---\ntype: concept\ntitle: No Headings\n---\n\nJust text.\n",
+      },
+    });
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/no-headings`)).text();
+    expect(body).not.toContain('class="outline"');
+  });
+});
+
+describe("Responsive wiki layout", () => {
+  test("Rails rendered beside content", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}/concepts/two-modes`)).text();
+    expect(body).toContain('<nav class="sidebar"');
+    expect(body).toContain('<main class="content">');
+    expect(body).toContain('<aside class="outline"');
+  });
+
+  test("Narrow viewports hide the rails", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}`)).text();
+    expect(body).toContain("@media (max-width: 1200px)");
+    expect(body).toContain(".outline { display: none; }");
+    expect(body).toContain("@media (max-width: 900px)");
+    expect(body).toContain(".sidebar { display: none; }");
+  });
+
+  test("No client script for the rails", async () => {
+    const { served } = await serveWiki();
+    const body = await (await fetch(`${served.url}/wiki/${REPO_ID}`)).text();
+    expect(body).not.toContain("<script");
   });
 });
 

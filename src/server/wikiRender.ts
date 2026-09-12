@@ -44,6 +44,8 @@ function getHighlighter(): Promise<Highlighter> {
   return highlighterPromise;
 }
 
+export type OutlineEntry = { level: number; text: string; id: string };
+
 export type RenderEnv = Env & {
   /** Registered repoId, used to build rewritten `/wiki/<repoId>/...` links. */
   repoId: string;
@@ -53,7 +55,24 @@ export type RenderEnv = Env & {
   conceptIds: Set<string>;
   /** Inline code span text -> forge URL; a matching span renders as a link. */
   sourceLinks?: ReadonlyMap<string, string>;
+  /** h1–h3 headings collected while rendering, for the page's outline. */
+  outline?: OutlineEntry[];
 };
+
+/** Per-render slug collision counts, kept off the serializable env fields. */
+const SLUG_COUNTS = Symbol("slugCounts");
+type SlugEnv = RenderEnv & { [SLUG_COUNTS]?: Map<string, number> };
+
+/** Lowercase, punctuation-stripped, space-to-hyphen anchor text. */
+export function slugifyHeading(text: string): string {
+  return (
+    text
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s-]/gu, "")
+      .trim()
+      .replace(/\s+/g, "-") || "section"
+  );
+}
 
 export function escapeHtml(s: string): string {
   return s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -117,6 +136,23 @@ async function buildWikiMarkdown(): Promise<MarkdownIt> {
     const href = (env as RenderEnv | undefined)?.sourceLinks?.get(token.content);
     const code = `<code>${escapeHtml(token.content)}</code>`;
     return href === undefined ? code : `<a href="${escapeAttr(href)}">${code}</a>`;
+  };
+
+  md.renderer.rules.heading_open = (tokens, idx, options, env, self) => {
+    const token = tokens[idx]!;
+    const level = Number(token.tag.slice(1));
+    if (level >= 1 && level <= 3) {
+      const text = (tokens[idx + 1]?.children ?? []).map((child) => child.content).join("");
+      const slugEnv = env as SlugEnv;
+      const counts = (slugEnv[SLUG_COUNTS] ??= new Map());
+      const base = slugifyHeading(text);
+      const seen = counts.get(base) ?? 0;
+      counts.set(base, seen + 1);
+      const id = seen === 0 ? base : `${base}-${seen}`;
+      token.attrSet("id", id);
+      (env as RenderEnv).outline?.push({ level, text, id });
+    }
+    return self.renderToken(tokens, idx, options);
   };
 
   md.renderer.rules.link_open = (tokens, idx, options, env, self) => {

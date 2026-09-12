@@ -3,6 +3,7 @@ import {
   createWikiMarkdown,
   hasMermaidDiagram,
   parseInlineCitation,
+  slugifyHeading,
   type RenderEnv,
 } from "./wikiRender.ts";
 
@@ -42,6 +43,41 @@ describe("Mermaid block rendered as a diagram", () => {
     expect(html).toContain('<pre class="mermaid">');
     expect(html).toContain("flowchart TD");
     expect(html).not.toContain("shiki");
+  });
+});
+
+describe("Heading anchors and outline", () => {
+  test("heading ids emitted and outline collected in document order", async () => {
+    const md = await createWikiMarkdown();
+    const e = env({ outline: [] });
+    const html = md.render("# Intro\n\n## Details\n", e);
+    expect(html).toContain('<h1 id="intro">');
+    expect(html).toContain('<h2 id="details">');
+    expect(e.outline).toEqual([
+      { level: 1, text: "Intro", id: "intro" },
+      { level: 2, text: "Details", id: "details" },
+    ]);
+  });
+
+  test("Duplicate headings get distinct ids", async () => {
+    const md = await createWikiMarkdown();
+    const e = env({ outline: [] });
+    const html = md.render("## Notes\n\n## Notes\n", e);
+    expect(html).toContain('<h2 id="notes">');
+    expect(html).toContain('<h2 id="notes-1">');
+    expect(e.outline?.map((o) => o.id)).toEqual(["notes", "notes-1"]);
+  });
+
+  test("Page without headings collects nothing", async () => {
+    const md = await createWikiMarkdown();
+    const e = env({ outline: [] });
+    const html = md.render("Just a paragraph.\n", e);
+    expect(e.outline).toEqual([]);
+    expect(html).not.toContain("id=");
+  });
+
+  test("slug drops punctuation and inline-code syntax", async () => {
+    expect(slugifyHeading("CLI entrypoint: `run()` & flags")).toBe("cli-entrypoint-run-flags");
   });
 });
 

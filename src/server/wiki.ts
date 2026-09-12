@@ -6,16 +6,18 @@ import type { Client } from "@libsql/client";
 import matter from "gray-matter";
 import type { Config } from "../config/config.ts";
 import { getChunk, listChunks } from "../index/db.ts";
-import { NO_MATTER_CACHE, bundleDir } from "../producer/verify.ts";
+import { joinBundlePath, resolveLink } from "../index/ingest.ts";
+import { NO_MATTER_CACHE, bundleDir, walkMd } from "../producer/verify.ts";
 import { citedPath, lineRangeOf } from "../producer/grounding.ts";
 import type { Registry, RepoRecord } from "../repoManager/registry.ts";
-import { webSourceUrl } from "../repoManager/webLinks.ts";
+import { webCommitUrl, webSourceUrl } from "../repoManager/webLinks.ts";
 import {
   createWikiMarkdown,
   escapeAttr,
   escapeHtml,
   hasMermaidDiagram,
   parseInlineCitation,
+  type OutlineEntry,
   type RenderEnv,
 } from "./wikiRender.ts";
 
@@ -108,6 +110,142 @@ export function renderRepoListBody(repos: Pick<RepoRecord, "repoId">[]): string 
   return `<ul class="repo-list">${items}</ul>`;
 }
 
+export type NavConcept = { path: string; title: string };
+export type NavEntry = { label: string; target: string };
+export type NavNode =
+  | { kind: "page"; path: string; label: string }
+  | { kind: "dir"; path: string; label: string; children: NavNode[] };
+
+export type SidebarRepo = Pick<
+  RepoRecord,
+  "repoId" | "source" | "lastIndexedSha" | "lastSuccessAt"
+>;
+
+/** An `index.md` body's Markdown links in document order, which is the only
+ *  in-bundle navigation signal (spec: wiki-viewer › Wiki navigation sidebar). */
+export function parseIndexOrder(body: string): NavEntry[] {
+  const out: NavEntry[] = [];
+  for (const m of body.matchAll(/\[([^\]]*)\]\(([^)\s]+)\)/g)) {
+    out.push({ label: m[1] ?? "", target: m[2] ?? "" });
+  }
+  return out;
+}
+
+function parentDir(path: string): string {
+  const i = path.lastIndexOf("/");
+  return i === -1 ? "" : path.slice(0, i);
+}
+
+function baseName(path: string): string {
+  return path.split("/").at(-1) ?? path;
+}
+
+/** Nests indexed concepts by directory and orders each directory's entries as
+ *  its `index.md` listed them, with anything unlisted appended in path order
+ *  (spec: wiki-viewer › Wiki navigation sidebar). A directory node exists when
+ *  a concept lives under it or the bundle ships an `index.md` for it. */
+export function buildNavTree(
+  concepts: NavConcept[],
+  orders: ReadonlyMap<string, NavEntry[]>,
+): NavNode[] {
+  const conceptIds = new Set(concepts.map((c) => c.path));
+  const titles = new Map(concepts.map((c) => [c.path, c.title]));
+  const dirs = new Set<string>([""]);
+  const addDir = (path: string): void => {
+    const parts = path.split("/");
+    for (let i = 1; i <= parts.length; i++) dirs.add(parts.slice(0, i).join("/"));
+  };
+  for (const c of concepts) {
+    const dir = parentDir(c.path);
+    if (dir !== "") addDir(dir);
+  }
+  for (const key of orders.keys()) {
+    if (key !== "") addDir(key);
+  }
+
+  const childDirs = (dir: string): string[] =>
+    [...dirs].filter((d) => d !== "" && parentDir(d) === dir);
+
+  const build = (dir: string): NavNode[] => {
+    const nodes: NavNode[] = [];
+    const listedPages = new Set<string>();
+    const listedDirs = new Set<string>();
+    for (const entry of orders.get(dir) ?? []) {
+      const page = resolveLink(entry.target, dir, conceptIds);
+      if (page !== null && parentDir(page) === dir) {
+        if (listedPages.has(page)) continue;
+        listedPages.add(page);
+        nodes.push({ kind: "page", path: page, label: titles.get(page) ?? baseName(page) });
+        continue;
+      }
+      if (!(entry.target.split("#")[0] ?? "").endsWith("/")) continue;
+      const child = joinBundlePath(entry.target, dir);
+      if (child === "" || parentDir(child) !== dir || !dirs.has(child)) continue;
+      if (listedDirs.has(child)) continue;
+      listedDirs.add(child);
+      nodes.push({
+        kind: "dir",
+        path: child,
+        label: entry.label || baseName(child),
+        children: build(child),
+      });
+    }
+
+    const rest: NavNode[] = [];
+    for (const child of childDirs(dir)) {
+      if (!listedDirs.has(child)) {
+        rest.push({ kind: "dir", path: child, label: baseName(child), children: build(child) });
+      }
+    }
+    for (const concept of concepts) {
+      if (parentDir(concept.path) === dir && !listedPages.has(concept.path)) {
+        rest.push({
+          kind: "page",
+          path: concept.path,
+          label: concept.title || baseName(concept.path),
+        });
+      }
+    }
+    rest.sort((a, b) => (a.path < b.path ? -1 : 1));
+    return [...nodes, ...rest];
+  };
+
+  return build("");
+}
+
+function renderIndexedLine(repo: SidebarRepo): string {
+  const sha = repo.lastIndexedSha;
+  if (sha === null || sha === "") return "";
+  const short = sha.slice(0, 7);
+  const href = webCommitUrl(repo.source, sha);
+  const revision =
+    href === null ? escapeHtml(short) : `<a href="${escapeAttr(href)}">${escapeHtml(short)}</a>`;
+  const date = repo.lastSuccessAt?.slice(0, 10);
+  return `<p class="indexed">Last indexed: ${date ? `${escapeHtml(date)} ` : ""}(${revision})</p>`;
+}
+
+function renderNavNodes(nodes: NavNode[], repoId: string, current: string): string {
+  return nodes
+    .map((node) => {
+      const currentAttr = node.path === current ? ' aria-current="page"' : "";
+      const link = `<a${currentAttr} href="${escapeAttr(`/wiki/${repoId}/${node.path}`)}">${escapeHtml(node.label)}</a>`;
+      return node.kind === "page"
+        ? `<li>${link}</li>`
+        : `<li class="dir">${link}<ul>${renderNavNodes(node.children, repoId, current)}</ul></li>`;
+    })
+    .join("");
+}
+
+/** The repository's page tree, with the current page or directory marked
+ *  (spec: wiki-viewer › Wiki navigation sidebar). */
+export function renderSidebar(tree: NavNode[], currentPath: string, repo: SidebarRepo): string {
+  return `<nav class="sidebar" aria-label="Wiki pages">${renderIndexedLine(repo)}<ul>${renderNavNodes(
+    tree,
+    repo.repoId,
+    currentPath,
+  )}</ul></nav>`;
+}
+
 /** Frontmatter `sources` as a linked footer: `repo://` citations link to the
  *  forge at the indexed revision when one is derivable and render as plain
  *  `path:range` text otherwise; non-repo resources are omitted (spec:
@@ -175,6 +313,8 @@ export function renderShell(opts: {
   breadcrumb: Crumb[];
   contentHtml: string;
   includeMermaid: boolean;
+  sidebarHtml?: string;
+  outline?: OutlineEntry[];
 }): string {
   const crumbHtml = opts.breadcrumb
     .map((c) =>
@@ -183,6 +323,8 @@ export function renderShell(opts: {
         : `<span aria-current="page">${escapeHtml(c.label)}</span>`,
     )
     .join(' <span class="sep">/</span> ');
+  const outlineHtml = renderOutline(opts.outline ?? []);
+  const layoutClass = opts.sidebarHtml === undefined ? "layout layout--plain" : "layout";
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -193,16 +335,35 @@ export function renderShell(opts: {
 </head>
 <body>
 <header class="topbar"><nav class="breadcrumb">${crumbHtml}</nav></header>
+<div class="${layoutClass}">
+${opts.sidebarHtml ?? ""}
 <main class="content">${opts.contentHtml}</main>
+${outlineHtml}
+</div>
 ${opts.includeMermaid ? MERMAID_BOOTSTRAP : ""}
 </body>
 </html>`;
+}
+
+/** "On this page" rail, indented 12px per level below the shallowest heading
+ *  (spec: wiki-viewer › On this page outline). */
+function renderOutline(entries: OutlineEntry[]): string {
+  if (entries.length === 0) return "";
+  const base = Math.min(...entries.map((e) => e.level));
+  const items = entries
+    .map(
+      (e) =>
+        `<li style="padding-left:${(e.level - base) * 12}px"><a href="#${escapeAttr(e.id)}">${escapeHtml(e.text)}</a></li>`,
+    )
+    .join("");
+  return `<aside class="outline" aria-label="On this page"><h2>On this page</h2><ul>${items}</ul></aside>`;
 }
 
 const WIKI_CSS = `
 :root {
   --bg: #ffffff; --fg: #1c1e21; --muted: #6b7280; --border: #e5e7eb;
   --link: #0b5fff; --code-bg: #f6f8fa; --shiki-light-bg: #f6f8fa; --shiki-dark-bg: #0d1117;
+  --topbar-h: 3.25rem; --rail-w: 16rem; --toc-w: 14rem;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -217,17 +378,51 @@ body {
   font-size: 16px; line-height: 1.5;
 }
 .topbar {
-  position: sticky; top: 0; background: var(--bg); border-bottom: 1px solid var(--border);
-  padding: 0.75rem 1.25rem; font-size: 0.9rem;
+  position: sticky; top: 0; z-index: 1; height: var(--topbar-h);
+  display: flex; align-items: center; overflow-x: auto; white-space: nowrap;
+  background: var(--bg); border-bottom: 1px solid var(--border);
+  padding: 0 1.5rem; font-size: 0.9rem;
 }
 .breadcrumb a { color: var(--muted); text-decoration: none; }
 .breadcrumb a:hover { color: var(--link); text-decoration: underline; }
 .breadcrumb .sep { color: var(--border); padding: 0 0.15rem; }
 .breadcrumb [aria-current] { color: var(--fg); font-weight: 600; }
-.content {
-  max-width: 42rem; margin: 0 auto; padding: 2.5rem 1.5rem 5rem;
+.layout {
+  display: grid; grid-template-columns: var(--rail-w) minmax(0, 1fr) var(--toc-w);
+  gap: 2rem; align-items: start; max-width: 96rem; margin: 0 auto; padding: 0 1.5rem;
 }
-.content h1, .content h2, .content h3 { line-height: 1.3; letter-spacing: -0.01em; }
+.layout--plain { display: block; }
+.sidebar, .outline {
+  position: sticky; top: var(--topbar-h); padding: 2rem 0 5rem;
+  max-height: calc(100vh - var(--topbar-h)); overflow-y: auto;
+}
+.sidebar { border-right: 1px dashed var(--border); padding-right: 1rem; }
+.sidebar ul { list-style: none; margin: 0; padding: 0; }
+.sidebar ul ul { margin-left: 0.75rem; }
+.sidebar li { margin: 0.1rem 0; }
+.sidebar a {
+  display: block; padding: 0.3rem 0.5rem; border-radius: 4px;
+  color: var(--muted); text-decoration: none;
+}
+.sidebar a:hover { background: var(--code-bg); color: var(--fg); }
+.sidebar a[aria-current="page"] { background: var(--code-bg); color: var(--fg); font-weight: 600; }
+.sidebar .indexed {
+  margin: 0 0 0.75rem; padding: 0 0.5rem; color: var(--muted); font-size: 0.75rem;
+}
+.sidebar .indexed a { display: inline; padding: 0; text-decoration: underline; }
+.outline { font-size: 0.8125rem; }
+.outline h2 {
+  margin: 0 0 0.5rem; font-size: 0.75rem; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--muted);
+}
+.outline ul { list-style: none; margin: 0; padding: 0; }
+.outline a { color: var(--muted); text-decoration: none; }
+.outline a:hover { color: var(--link); }
+.content { max-width: 42rem; width: 100%; margin: 0 auto; padding: 2.5rem 0 5rem; }
+.layout--plain .content { padding: 2.5rem 1.5rem 5rem; }
+.content h1, .content h2, .content h3 {
+  line-height: 1.3; letter-spacing: -0.01em; scroll-margin-top: calc(var(--topbar-h) + 0.5rem);
+}
 .content a { color: var(--link); }
 .content pre { overflow-x: auto; border-radius: 6px; padding: 1rem; }
 .content pre.shiki, .content pre.shiki span { color: var(--shiki-light); }
@@ -249,6 +444,14 @@ body {
 .content .sources { margin-top: 2.5rem; border-top: 1px solid var(--border); }
 .content .sources h2 { font-size: 1rem; color: var(--muted); }
 .content .sources ul { padding-left: 1.25rem; }
+@media (max-width: 1200px) {
+  .layout { grid-template-columns: var(--rail-w) minmax(0, 1fr); }
+  .outline { display: none; }
+}
+@media (max-width: 900px) {
+  .layout { grid-template-columns: minmax(0, 1fr); padding: 0 1.25rem; }
+  .sidebar { display: none; }
+}
 `;
 
 const MERMAID_BOOTSTRAP = `<script type="module">
@@ -298,7 +501,7 @@ async function conceptIdSet(db: Client, repoId: string): Promise<Set<string>> {
   return new Set(chunks.map((c) => c.path));
 }
 
-type RenderedPage = { html: string; title: string };
+type RenderedPage = { html: string; title: string; outline: OutlineEntry[] };
 
 /** Repo root (`rest === ""`) or a directory's `index.md` — read straight off
  *  disk since `index.md` files are excluded from indexing (spec: wiki-viewer
@@ -320,10 +523,11 @@ async function renderIndexPage(
     repoId: repo.repoId,
     fromDir: rest,
     conceptIds: await conceptIdSet(db, repo.repoId),
+    outline: [],
   };
   const html = md.render(body, env);
   const title = rest === "" ? repo.repoId : (rest.split("/").at(-1) ?? repo.repoId);
-  return { html, title };
+  return { html, title, outline: env.outline ?? [] };
 }
 
 /** A leaf wiki concept page (spec: wiki-viewer › Rendered page content). */
@@ -351,11 +555,40 @@ async function renderConceptPage(
     fromDir,
     conceptIds: await conceptIdSet(db, repo.repoId),
     sourceLinks: inlineSourceLinks(parsed.content, repo),
+    outline: [],
   };
   const html = md.render(parsed.content, env) + renderSources(parsed.data, repo);
   const title =
     typeof parsed.data.title === "string" ? parsed.data.title : (path.split("/").at(-1) ?? path);
-  return { html, title };
+  return { html, title, outline: env.outline ?? [] };
+}
+
+/** Every directory's `index.md` order, read straight off disk — the authored
+ *  order is the sidebar tree's only in-bundle signal (spec: wiki-viewer ›
+ *  Wiki navigation sidebar). */
+async function readIndexOrders(clonePath: string): Promise<Map<string, NavEntry[]>> {
+  const root = bundleDir(clonePath);
+  const dirs = new Set<string>([""]);
+  for (const file of await walkMd(root)) {
+    const dir = file.includes("/") ? file.slice(0, file.lastIndexOf("/")) : "";
+    const parts = dir.split("/");
+    for (let i = 1; i <= parts.length; i++) dirs.add(parts.slice(0, i).join("/"));
+  }
+  const orders = new Map<string, NavEntry[]>();
+  for (const dir of dirs) {
+    const raw = await readIndexMarkdown(dir === "" ? root : join(root, dir));
+    if (raw !== null) orders.set(dir, parseIndexOrder(matter(raw, NO_MATTER_CACHE).content));
+  }
+  return orders;
+}
+
+async function buildSidebar(db: Client, repo: RepoRecord, currentPath: string): Promise<string> {
+  const concepts = (await listChunks(db, repo.repoId, "wiki")).map((c) => ({
+    path: c.path,
+    title: c.title ?? c.path.split("/").at(-1) ?? c.path,
+  }));
+  const orders = await readIndexOrders(repo.clonePath);
+  return renderSidebar(buildNavTree(concepts, orders), currentPath, repo);
 }
 
 function sendHtml(res: ServerResponse, status: number, html: string): void {
@@ -441,11 +674,22 @@ export async function handleWiki(
     return true;
   }
 
-  const page =
-    resolved.rest !== ""
-      ? ((await renderConceptPage(deps.db, repo, resolved.rest)) ??
-        (await renderIndexPage(deps.db, repo, resolved.rest)))
-      : await renderIndexPage(deps.db, repo, "");
+  // The bare repo URL lands on the bundle's `overview` entry point when one
+  // exists; a missing concept or a stale index falls back to the listing.
+  let currentPath = resolved.rest;
+  let page: RenderedPage | null;
+  if (resolved.rest !== "") {
+    page =
+      (await renderConceptPage(deps.db, repo, resolved.rest)) ??
+      (await renderIndexPage(deps.db, repo, resolved.rest));
+  } else {
+    page = await renderConceptPage(deps.db, repo, "overview");
+    if (page === null) {
+      page = await renderIndexPage(deps.db, repo, "");
+    } else {
+      currentPath = "overview";
+    }
+  }
   if (!page) {
     sendText(res, 404, "not found");
     return true;
@@ -459,6 +703,8 @@ export async function handleWiki(
       breadcrumb: buildBreadcrumb(resolved.repoId, resolved.rest, page.title),
       contentHtml: page.html,
       includeMermaid: hasMermaidDiagram(page.html),
+      sidebarHtml: await buildSidebar(deps.db, repo, currentPath),
+      outline: page.outline,
     }),
   );
   return true;
